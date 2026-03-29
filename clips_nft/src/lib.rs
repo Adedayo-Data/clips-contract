@@ -4,11 +4,32 @@
 //! with built-in royalty support for content creators.
 //! Royalties can be paid in XLM or any custom Stellar asset (SEP-0041 token).
 //!
+//! # Clip verification
+//!
+//! Before a clip can be minted the backend must sign a verification payload
+//! with its Ed25519 private key. The contract verifies the signature on-chain
+//! using `env.crypto().ed25519_verify()`.
+//!
+//! ## Payload format
+//!
+//! ```text
+//! payload = SHA-256( clip_id_le_bytes || owner_address_bytes || metadata_uri_bytes )
+//! ```
+//!
+//! - `clip_id` is encoded as 4 little-endian bytes.
+//! - `owner_address_bytes` is the raw XDR encoding of the `Address` produced by
+//!   `env.crypto().sha256(&owner.to_xdr(&env))` — i.e. the contract hashes the
+//!   address XDR so the payload is always a fixed-size 32-byte digest.
+//! - The final SHA-256 over the concatenation is what gets signed.
+//!
+//! The backend registers its Ed25519 public key once via `set_signer` (admin only).
+//! The public key is stored in instance storage under `DataKey::Signer`.
+//!
 //! # Storage layout & gas cost notes
 //!
 //! ## Storage tiers used
 //! - `instance`   – cheap, loaded once per tx, shared across all calls in the tx.
-//!                  Used for: Admin, NextTokenId, Paused.
+//!                  Used for: Admin, NextTokenId, Paused, Signer.
 //! - `persistent` – per-entry fee, survives ledger expiry extension.
 //!                  Used for: TokenData (owner+clip_id packed), Metadata, Royalty,
 //!                  ClipIdMinted (dedup guard).
@@ -18,12 +39,11 @@
 //! ### `mint`
 //! | Op              | Tier       | Count |
 //! |-----------------|------------|-------|
-//! | instance read   | instance   | 3     | (Admin, NextTokenId, Paused)
+//! | instance read   | instance   | 4     | (Admin, NextTokenId, Paused, Signer)
 //! | instance write  | instance   | 1     | (NextTokenId++)
 //! | persistent read | persistent | 1     | (ClipIdMinted dedup check)
-//! | persistent write| persistent | 3     | (TokenData, Metadata, Royalty)
-//! | persistent write| persistent | 1     | (ClipIdMinted)
-//! Total persistent writes: **4**  (was 9 before optimisation)
+//! | persistent write| persistent | 4     | (TokenData, Metadata, Royalty, ClipIdMinted)
+//! Total persistent writes: **4**
 //!
 //! ### `transfer`
 //! | Op              | Tier       | Count |
@@ -31,30 +51,25 @@
 //! | instance read   | instance   | 1     | (Paused)
 //! | persistent read | persistent | 1     | (TokenData — owner check)
 //! | persistent write| persistent | 1     | (TokenData — new owner)
-//! Total persistent writes: **1**  (was 3 before optimisation)
+//! Total persistent writes: **1**
 //!
 //! ### `burn`
 //! | Op              | Tier       | Count |
 //! |-----------------|------------|-------|
 //! | persistent read | persistent | 1     | (TokenData — owner check + clip_id)
-//! | persistent remove| persistent| 3     | (TokenData, Metadata, Royalty)
-//! | persistent remove| persistent| 1     | (ClipIdMinted)
+//! | persistent remove| persistent| 4     | (TokenData, Metadata, Royalty, ClipIdMinted)
 //! Total persistent removes: **4**
 //!
-//! ## Removed counters / indexes (vs. previous version)
-//! - `Balance(Address)` — per-address token counter removed; `balance_of` view
-//!   removed. Saves 1 read + 1 write on every mint, transfer, and burn.
-//! - `TokenCount` — replaced by `next_token_id - 1`; saves 1 read + 1 write
-//!   on every mint and burn.
-//! - `TokenClipId(TokenId)` — reverse map removed; clip_id is now packed into
-//!   `TokenData` alongside the owner. Saves 1 write on mint and 1 read + 1
-//!   remove on burn.
+//! ## Removed counters / indexes (vs. earlier version)
+//! - `Balance(Address)` — per-address token counter removed.
+//! - `TokenCount` — replaced by `next_token_id - 1`.
+//! - `TokenClipId(TokenId)` — clip_id packed into `TokenData`.
 
 #![no_std]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype,
-    symbol_short, Address, Env, String,
+    symbol_short, Address, Bytes, BytesN, Env, String,
 };
 
 /// Custom errors for the NFT contract
@@ -75,6 +90,10 @@ pub enum Error {
     InvalidSalePrice = 6,
     /// Contract is paused — minting and transfers are blocked
     ContractPaused = 7,
+    /// Backend signature over the mint payload is invalid
+    InvalidSignature = 8,
+    /// No backend signer public key has been registered yet
+    SignerNotSet = 9,
 }
 
 /// Token ID type
@@ -140,6 +159,8 @@ pub enum DataKey {
     Royalty(TokenId),
     /// Dedup guard: clip_id → token_id (persistent storage)
     ClipIdMinted(u32),
+    /// Ed25519 public key of the trusted backend signer (instance storage)
+    Signer,
 }
 
 /// Event emitted when a new NFT is minted
@@ -164,6 +185,24 @@ impl ClipsNftContract {
         // NextTokenId starts at 1; total_supply = NextTokenId - 1
         env.storage().instance().set(&DataKey::NextTokenId, &1u32);
         env.storage().instance().set(&DataKey::Paused, &false);
+        // Signer is not set at init — call set_signer before minting.
+    }
+
+    /// Register (or rotate) the backend Ed25519 public key used to verify
+    /// clip ownership before minting. Only callable by the admin.
+    ///
+    /// # Arguments
+    /// * `admin`  - Must be the contract admin
+    /// * `pubkey` - 32-byte Ed25519 public key of the trusted backend signer
+    pub fn set_signer(env: Env, admin: Address, pubkey: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Signer, &pubkey);
+        Ok(())
+    }
+
+    /// Return the currently registered backend signer public key, if any.
+    pub fn get_signer(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::Signer)
     }
 
     // -------------------------------------------------------------------------
@@ -202,15 +241,28 @@ impl ClipsNftContract {
 
     /// Mint a new NFT for a video clip.
     ///
+    /// Requires a valid Ed25519 `signature` from the registered backend signer
+    /// over the canonical mint payload, proving the clip exists and belongs to
+    /// `to`. The payload is:
+    ///
+    /// ```text
+    /// payload = SHA-256(
+    ///     clip_id_le_4_bytes
+    ///     || SHA-256(owner_address_xdr)   // 32 bytes
+    ///     || SHA-256(metadata_uri_bytes)  // 32 bytes
+    /// )
+    /// ```
+    ///
     /// Storage writes (persistent): TokenData, Metadata, Royalty, ClipIdMinted = **4**
     /// Instance writes: NextTokenId = **1**
     ///
     /// # Arguments
     /// * `admin`        - Must be the contract admin
-    /// * `to`           - Address that will own the NFT
-    /// * `clip_id`      - Unique off-chain clip identifier
-    /// * `metadata_uri` - IPFS or Arweave URI pointing to the clip metadata JSON
+    /// * `to`           - Address that will own the NFT (must match the signed payload)
+    /// * `clip_id`      - Unique off-chain clip identifier (must match the signed payload)
+    /// * `metadata_uri` - IPFS or Arweave URI (must match the signed payload)
     /// * `royalty`      - Royalty configuration
+    /// * `signature`    - 64-byte Ed25519 signature from the backend signer
     pub fn mint(
         env: Env,
         admin: Address,
@@ -218,9 +270,13 @@ impl ClipsNftContract {
         clip_id: u32,
         metadata_uri: String,
         royalty: Royalty,
+        signature: BytesN<64>,
     ) -> Result<TokenId, Error> {
         Self::require_admin(&env, &admin)?;
         Self::require_not_paused(&env)?;
+
+        // Verify backend signature before any state reads/writes
+        Self::verify_clip_signature(&env, &to, clip_id, &metadata_uri, &signature)?;
 
         // Dedup check — one persistent read
         if env
@@ -481,6 +537,49 @@ impl ClipsNftContract {
             .ok_or(Error::InvalidTokenId)
     }
 
+    /// Verify the backend Ed25519 signature over the canonical mint payload.
+    ///
+    /// Payload construction (all hashing via SHA-256):
+    /// ```text
+    /// owner_hash    = SHA-256(XDR(owner))
+    /// uri_hash      = SHA-256(UTF-8(metadata_uri))
+    /// message       = SHA-256( clip_id_le4 || owner_hash || uri_hash )
+    /// ```
+    /// The signer signs `message` (32 bytes) with their Ed25519 private key.
+    fn verify_clip_signature(
+        env: &Env,
+        owner: &Address,
+        clip_id: u32,
+        metadata_uri: &String,
+        signature: &BytesN<64>,
+    ) -> Result<(), Error> {
+        let signer: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signer)
+            .ok_or(Error::SignerNotSet)?;
+
+        // Hash the owner address XDR so the payload is always fixed-width
+        let owner_hash: BytesN<32> = env.crypto().sha256(&owner.clone().to_xdr(env));
+
+        // Hash the metadata URI bytes
+        let uri_hash: BytesN<32> = env.crypto().sha256(&Bytes::from(metadata_uri.to_xdr(env)));
+
+        // Build the 68-byte pre-image: 4 (clip_id LE) + 32 (owner_hash) + 32 (uri_hash)
+        let mut preimage = Bytes::new(env);
+        preimage.extend_from_array(&clip_id.to_le_bytes());
+        preimage.append(&Bytes::from(owner_hash));
+        preimage.append(&Bytes::from(uri_hash));
+
+        // Final message digest that was signed
+        let message: BytesN<32> = env.crypto().sha256(&preimage);
+
+        // Panics (traps) on invalid signature — map to our error type
+        env.crypto().ed25519_verify(&signer, &Bytes::from(message), signature);
+
+        Ok(())
+    }
+
     fn require_admin(env: &Env, addr: &Address) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -512,7 +611,7 @@ impl ClipsNftContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::Env;
+    use soroban_sdk::{testutils::ed25519::Sign, Env};
 
     fn setup() -> (Env, Address, Address, Address) {
         let env = Env::default();
@@ -527,19 +626,55 @@ mod tests {
         Royalty { recipient, basis_points: 500, asset_address: None }
     }
 
+    /// Build the canonical mint payload and sign it with `signer_secret`.
+    /// Mirrors the on-chain `verify_clip_signature` logic exactly.
+    fn sign_mint(
+        env: &Env,
+        signer_secret: &soroban_sdk::testutils::ed25519::Keypair,
+        owner: &Address,
+        clip_id: u32,
+        metadata_uri: &String,
+    ) -> BytesN<64> {
+        let owner_hash: BytesN<32> = env.crypto().sha256(&owner.clone().to_xdr(env));
+        let uri_hash: BytesN<32> = env.crypto().sha256(&Bytes::from(metadata_uri.to_xdr(env)));
+
+        let mut preimage = Bytes::new(env);
+        preimage.extend_from_array(&clip_id.to_le_bytes());
+        preimage.append(&Bytes::from(owner_hash));
+        preimage.append(&Bytes::from(uri_hash));
+
+        let message: BytesN<32> = env.crypto().sha256(&preimage);
+        signer_secret.sign(env, &Bytes::from(message))
+    }
+
+    /// Register a fresh signer keypair and return (pubkey, secret).
+    fn register_signer(
+        env: &Env,
+        client: &ClipsNftContractClient,
+        admin: &Address,
+    ) -> soroban_sdk::testutils::ed25519::Keypair {
+        let keypair = soroban_sdk::testutils::ed25519::Keypair::generate(env);
+        client.set_signer(admin, &keypair.public_key());
+        keypair
+    }
+
     fn do_mint(
         client: &ClipsNftContractClient,
         env: &Env,
         admin: &Address,
         to: &Address,
         clip_id: u32,
+        keypair: &soroban_sdk::testutils::ed25519::Keypair,
     ) -> TokenId {
+        let uri = String::from_str(env, "ipfs://QmExample");
+        let sig = sign_mint(env, keypair, to, clip_id, &uri);
         client.mint(
             admin,
             to,
             &clip_id,
-            &String::from_str(env, "ipfs://QmExample"),
+            &uri,
             &default_royalty(to.clone()),
+            &sig,
         )
     }
 
@@ -549,8 +684,9 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 42);
+        let token_id = do_mint(&client, &env, &admin, &user1, 42, &kp);
         assert_eq!(token_id, 1);
 
         assert_eq!(client.owner_of(&token_id), user1);
@@ -567,8 +703,9 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 99);
+        let token_id = do_mint(&client, &env, &admin, &user1, 99, &kp);
         assert_eq!(client.clip_token_id(&99), token_id);
     }
 
@@ -579,9 +716,10 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        do_mint(&client, &env, &admin, &user1, 7);
-        do_mint(&client, &env, &admin, &user1, 7);
+        do_mint(&client, &env, &admin, &user1, 7, &kp);
+        do_mint(&client, &env, &admin, &user1, 7, &kp);
     }
 
     #[test]
@@ -590,8 +728,9 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 5);
+        let token_id = do_mint(&client, &env, &admin, &user1, 5, &kp);
 
         let events = env.events().all();
         assert!(!events.is_empty());
@@ -602,14 +741,111 @@ mod tests {
         assert_eq!(event_data.to, user1);
     }
 
+    // -------------------------------------------------------------------------
+    // Signature verification tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_mint_fails_without_signer_set() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        // No set_signer call
+
+        let kp = soroban_sdk::testutils::ed25519::Keypair::generate(&env);
+        let uri = String::from_str(&env, "ipfs://QmExample");
+        let sig = sign_mint(&env, &kp, &user1, 1, &uri);
+
+        let result = client.try_mint(&admin, &user1, &1u32, &uri, &default_royalty(user1.clone()), &sig);
+        assert_eq!(result, Err(Ok(Error::SignerNotSet)));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_mint_fails_with_wrong_signature() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        register_signer(&env, &client, &admin);
+
+        // Sign with a *different* keypair — not the registered signer
+        let wrong_kp = soroban_sdk::testutils::ed25519::Keypair::generate(&env);
+        let uri = String::from_str(&env, "ipfs://QmExample");
+        let bad_sig = sign_mint(&env, &wrong_kp, &user1, 1, &uri);
+
+        // ed25519_verify traps on bad sig, which surfaces as a panic in tests
+        client.mint(&admin, &user1, &1u32, &uri, &default_royalty(user1.clone()), &bad_sig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_mint_fails_with_wrong_owner_in_payload() {
+        let (env, admin, user1, user2) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        let uri = String::from_str(&env, "ipfs://QmExample");
+        // Signature is over user2 but we pass user1 as `to`
+        let sig_for_user2 = sign_mint(&env, &kp, &user2, 1, &uri);
+
+        client.mint(&admin, &user1, &1u32, &uri, &default_royalty(user1.clone()), &sig_for_user2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_mint_fails_with_wrong_clip_id_in_payload() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        let uri = String::from_str(&env, "ipfs://QmExample");
+        // Signature is over clip_id=99 but we pass clip_id=1
+        let sig_for_99 = sign_mint(&env, &kp, &user1, 99, &uri);
+
+        client.mint(&admin, &user1, &1u32, &uri, &default_royalty(user1.clone()), &sig_for_99);
+    }
+
+    #[test]
+    fn test_set_signer_and_rotate() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let kp1 = register_signer(&env, &client, &admin);
+        assert_eq!(client.get_signer(), Some(kp1.public_key()));
+
+        // Rotate to a new keypair
+        let kp2 = soroban_sdk::testutils::ed25519::Keypair::generate(&env);
+        client.set_signer(&admin, &kp2.public_key());
+        assert_eq!(client.get_signer(), Some(kp2.public_key()));
+
+        // Old signer's signature should now fail
+        let uri = String::from_str(&env, "ipfs://QmExample");
+        let old_sig = sign_mint(&env, &kp1, &user1, 1, &uri);
+        let result = client.try_mint(&admin, &user1, &1u32, &uri, &default_royalty(user1.clone()), &old_sig);
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Transfer / royalty / burn / pause tests (unchanged logic)
+    // -------------------------------------------------------------------------
+
     #[test]
     fn test_transfer_updates_owner() {
         let (env, admin, user1, user2) = setup();
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+        let token_id = do_mint(&client, &env, &admin, &user1, 1, &kp);
         client.transfer(&user1, &user2, &token_id);
 
         assert_eq!(client.owner_of(&token_id), user2);
@@ -621,11 +857,12 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
         assert_eq!(client.total_supply(), 0);
-        do_mint(&client, &env, &admin, &user1, 1);
+        do_mint(&client, &env, &admin, &user1, 1, &kp);
         assert_eq!(client.total_supply(), 1);
-        do_mint(&client, &env, &admin, &user1, 2);
+        do_mint(&client, &env, &admin, &user1, 2, &kp);
         assert_eq!(client.total_supply(), 2);
     }
 
@@ -635,12 +872,13 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+        let token_id = do_mint(&client, &env, &admin, &user1, 1, &kp);
 
         let info = client.royalty_info(&token_id, &1_000_000i128);
         assert_eq!(info.receiver, user1);
-        assert_eq!(info.royalty_amount, 50_000i128); // 5%
+        assert_eq!(info.royalty_amount, 50_000i128);
         assert_eq!(info.asset_address, None);
     }
 
@@ -650,6 +888,7 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
         let asset_addr = Address::generate(&env);
         let royalty = Royalty {
@@ -657,13 +896,9 @@ mod tests {
             basis_points: 1000,
             asset_address: Some(asset_addr.clone()),
         };
-        let token_id = client.mint(
-            &admin,
-            &user1,
-            &2u32,
-            &String::from_str(&env, "ipfs://QmCustom"),
-            &royalty,
-        );
+        let uri = String::from_str(&env, "ipfs://QmCustom");
+        let sig = sign_mint(&env, &kp, &user1, 2, &uri);
+        let token_id = client.mint(&admin, &user1, &2u32, &uri, &royalty, &sig);
 
         let info = client.royalty_info(&token_id, &500i128);
         assert_eq!(info.royalty_amount, 50i128);
@@ -676,8 +911,9 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+        let token_id = do_mint(&client, &env, &admin, &user1, 1, &kp);
 
         let asset_addr = Address::generate(&env);
         let new_royalty = Royalty {
@@ -699,13 +935,14 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+        let token_id = do_mint(&client, &env, &admin, &user1, 1, &kp);
         client.burn(&user1, &token_id);
 
         assert!(!client.exists(&token_id));
         // clip_id dedup entry also removed — can re-mint same clip_id
-        let token_id2 = do_mint(&client, &env, &admin, &user1, 1);
+        let token_id2 = do_mint(&client, &env, &admin, &user1, 1, &kp);
         assert!(client.exists(&token_id2));
     }
 
@@ -715,18 +952,15 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
         assert!(!client.is_paused());
         client.pause(&admin);
         assert!(client.is_paused());
 
-        let result = client.try_mint(
-            &admin,
-            &user1,
-            &1u32,
-            &String::from_str(&env, "ipfs://QmPaused"),
-            &default_royalty(user1.clone()),
-        );
+        let uri = String::from_str(&env, "ipfs://QmPaused");
+        let sig = sign_mint(&env, &kp, &user1, 1, &uri);
+        let result = client.try_mint(&admin, &user1, &1u32, &uri, &default_royalty(user1.clone()), &sig);
         assert_eq!(result, Err(Ok(Error::ContractPaused)));
     }
 
@@ -736,8 +970,9 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+        let token_id = do_mint(&client, &env, &admin, &user1, 1, &kp);
         client.pause(&admin);
 
         let result = client.try_transfer(&user1, &user2, &token_id);
@@ -750,12 +985,13 @@ mod tests {
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
 
         client.pause(&admin);
         client.unpause(&admin);
         assert!(!client.is_paused());
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+        let token_id = do_mint(&client, &env, &admin, &user1, 1, &kp);
         client.transfer(&user1, &user2, &token_id);
         assert_eq!(client.owner_of(&token_id), user2);
     }
