@@ -7,7 +7,17 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype,
+
+    address::Address,
+    collections::Map,
+    env,
+    symbol_short,
+    vec,
+    String,
+    Symbol,
+
     symbol_short, Address, Env, String,
+
 };
 
 /// Custom errors for the NFT contract
@@ -83,6 +93,18 @@ pub struct MintEvent {
     pub metadata_uri: String,
 }
 
+/// Clip-specific metadata
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipMetadata {
+    /// Virality score (0-10000)
+    pub virality_score: u32,
+    /// Original duration in seconds
+    pub original_duration: u32,
+    /// Timestamp when created
+    pub created_at: u64,
+}
+
 /// NFT Contract
 #[contract]
 pub struct ClipsNftContract;
@@ -104,11 +126,19 @@ impl ClipsNftContract {
     /// `TokenAlreadyMinted`.
     ///
     /// # Arguments
+
+    /// * `to` - Address that will own the NFT
+    /// * `metadata` - Token metadata
+    /// * `clip_metadata` - Clip-specific metadata
+    /// * `royalty` - Royalty configuration
+    /// 
+
     /// * `to`           - Address that will own the NFT
     /// * `clip_id`      - Unique off-chain clip identifier (u32)
     /// * `metadata_uri` - IPFS or Arweave URI pointing to the clip metadata JSON
     /// * `royalty`      - Royalty configuration for this token
     ///
+
     /// # Returns
     /// The on-chain `TokenId` assigned to this clip.
     ///
@@ -118,8 +148,13 @@ impl ClipsNftContract {
         env: Env,
         admin: Address,
         to: Address,
+
+        metadata: TokenMetadata,
+        clip_metadata: ClipMetadata,
+
         clip_id: u32,
         metadata_uri: String,
+
         royalty: Royalty,
     ) -> Result<TokenId, Error> {
         Self::require_admin(&env, &admin)?;
@@ -142,6 +177,36 @@ impl ClipsNftContract {
             .instance()
             .get(&DataKey::NextTokenId)
             .unwrap_or(1);
+
+        
+        // Store token metadata
+        let metadata_key = (Symbol::new(&env, "metadata"), token_id);
+        env.storage().persistent().set(&metadata_key, &metadata);
+
+        // Store clip-specific metadata
+        let clip_metadata_key = (Symbol::new(&env, "clip_metadata"), token_id);
+        env.storage().persistent().set(&clip_metadata_key, &clip_metadata);
+        
+        // Store royalty
+        let royalty_key = (Symbol::new(&env, "royalty"), token_id);
+        env.storage().persistent().set(&royalty_key, &royalty);
+        
+        // Store owner
+        let owner_key = (Symbol::new(&env, "owner"), token_id);
+        env.storage().persistent().set(&owner_key, &to);
+        
+        // Increment next token ID
+        env.storage().instance().set(&next_token_key, &(token_id + 1));
+        
+        // Update token count
+        let token_count_key = Symbol::new(&env, "token_count");
+        let count: u64 = env.storage().instance().get(&token_count_key).unwrap_or(0);
+        env.storage().instance().set(&token_count_key, &(count + 1));
+        
+        // Emit event
+        soroban_sdk::log!(&env, "NFT minted: {} to {}", token_id, to);
+        
+
 
         // Store metadata URI directly (lightweight — full JSON lives off-chain)
         env.storage()
@@ -197,6 +262,7 @@ impl ClipsNftContract {
             },
         );
 
+
         Ok(token_id)
     }
 
@@ -250,6 +316,19 @@ impl ClipsNftContract {
             .ok_or(Error::InvalidTokenId)
     }
 
+
+    /// Get clip-specific metadata
+    pub fn get_clip_metadata(env: soroban_sdk::Env, token_id: TokenId) -> Result<ClipMetadata, Error> {
+        let clip_metadata_key = (Symbol::new(&env, "clip_metadata"), token_id);
+        env.storage().persistent().get(&clip_metadata_key)
+            .ok_or(Error::InvalidTokenId)
+    }
+
+    /// Get royalty info
+    pub fn get_royalty(env: soroban_sdk::Env, token_id: TokenId) -> Result<Royalty, Error> {
+        let royalty_key = (Symbol::new(&env, "royalty"), token_id);
+        env.storage().persistent().get(&royalty_key)
+
     /// Returns the number of tokens owned by an address
     pub fn balance_of(env: Env, owner: Address) -> u32 {
         env.storage()
@@ -275,6 +354,7 @@ impl ClipsNftContract {
         env.storage()
             .persistent()
             .get(&DataKey::Metadata(token_id))
+
             .ok_or(Error::InvalidTokenId)
     }
 
@@ -392,6 +472,26 @@ impl ClipsNftContract {
             return Err(Error::Unauthorized);
         }
 
+        
+        // Remove all data
+        env.storage().persistent().remove(&owner_key);
+        
+        let metadata_key = (Symbol::new(&env, "metadata"), token_id);
+        env.storage().persistent().remove(&metadata_key);
+        
+        let clip_metadata_key = (Symbol::new(&env, "clip_metadata"), token_id);
+        env.storage().persistent().remove(&clip_metadata_key);
+        
+        let royalty_key = (Symbol::new(&env, "royalty"), token_id);
+        env.storage().persistent().remove(&royalty_key);
+        
+        // Update count
+        let token_count_key = Symbol::new(&env, "token_count");
+        let count: u64 = env.storage().instance().get(&token_count_key).unwrap_or(0);
+        env.storage().instance().set(&token_count_key, &(count.saturating_sub(1)));
+        
+
+
         env.storage().persistent().remove(&DataKey::Owner(token_id));
         env.storage().persistent().remove(&DataKey::Metadata(token_id));
         env.storage().persistent().remove(&DataKey::Royalty(token_id));
@@ -495,6 +595,54 @@ mod tests {
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
 
+        
+        // Create metadata
+        let metadata = TokenMetadata {
+            title: String::from_str(&env, "My First Clip"),
+            description: String::from_str(&env, "A viral moment"),
+            media_url: String::from_str(&env, "ipfs://QmExample"),
+            thumbnail_url: String::from_str(&env, "ipfs://QmThumb"),
+            creator: user.clone(),
+            created_at: 1000,
+        };
+
+        let clip_metadata = ClipMetadata {
+            virality_score: 8500,
+            original_duration: 30,
+            created_at: 1000,
+        };
+        
+        let royalty = Royalty {
+            recipient: user.clone(),
+            basis_points: 500, // 5%
+        };
+        
+        // Mint NFT
+        let token_id = client.mint(&admin, &user, &metadata, &clip_metadata, &royalty);
+        assert_eq!(token_id, 1);
+        
+        // Verify metadata
+        let retrieved_metadata = client.get_metadata(&token_id);
+        assert_eq!(retrieved_metadata.title, String::from_str(&env, "My First Clip"));
+
+        // Verify clip metadata
+        let retrieved_clip_metadata = client.get_clip_metadata(&token_id);
+        assert_eq!(retrieved_clip_metadata.virality_score, 8500);
+        assert_eq!(retrieved_clip_metadata.original_duration, 30);
+        
+        // Verify royalty
+        let retrieved_royalty = client.get_royalty(&token_id);
+        assert_eq!(retrieved_royalty.basis_points, 500);
+        
+        // Verify owner
+        let owner = client.get_owner(&token_id);
+        assert_eq!(owner, user);
+        
+        // Verify total supply
+        let supply = client.total_supply();
+        assert_eq!(supply, 1);
+
+
         let token_id = do_mint(&client, &env, &admin, &user1, 42);
         assert_eq!(token_id, 1);
 
@@ -505,6 +653,7 @@ mod tests {
             String::from_str(&env, "ipfs://QmExample")
         );
         assert_eq!(client.total_supply(), 1);
+
     }
 
     #[test]
@@ -557,7 +706,35 @@ mod tests {
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
 
+        
+        // Mint NFT to user1
+        let metadata = TokenMetadata {
+            title: String::from_str(&env, "Test"),
+            description: String::from_str(&env, "Test"),
+            media_url: String::from_str(&env, ""),
+            thumbnail_url: String::from_str(&env, ""),
+            creator: user1.clone(),
+            created_at: 1000,
+        };
+
+        let clip_metadata = ClipMetadata {
+            virality_score: 0,
+            original_duration: 0,
+            created_at: 1000,
+        };
+        
+        let royalty = Royalty {
+            recipient: user1.clone(),
+            basis_points: 500,
+        };
+        
+        let token_id = client.mint(&admin, &user1, &metadata, &clip_metadata, &royalty);
+        
+        // Transfer to user2
+
+
         let token_id = do_mint(&client, &env, &admin, &user1, 1);
+
         client.transfer(&user1, &user2, &token_id);
 
         assert_eq!(client.owner_of(&token_id), user2);
@@ -613,11 +790,44 @@ mod tests {
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
 
+        
+        // Mint NFT
+        let metadata = TokenMetadata {
+            title: String::from_str(&env, "Test"),
+            description: String::from_str(&env, "Test"),
+            media_url: String::from_str(&env, ""),
+            thumbnail_url: String::from_str(&env, ""),
+            creator: user.clone(),
+            created_at: 1000,
+        };
+
+        let clip_metadata = ClipMetadata {
+            virality_score: 0,
+            original_duration: 0,
+            created_at: 1000,
+        };
+        
+        let royalty = Royalty {
+            recipient: user.clone(),
+            basis_points: 500,
+        };
+        
+        let token_id = client.mint(&admin, &user, &metadata, &clip_metadata, &royalty);
+        
+        // Burn NFT
+        client.burn(&user, &token_id);
+        
+        // Verify burned (owner should not exist)
+        let exists = client.exists(&token_id);
+        assert!(!exists);
+
+
         let token_id = do_mint(&client, &env, &admin, &user1, 1);
         client.burn(&user1, &token_id);
 
         assert!(!client.exists(&token_id));
         assert_eq!(client.balance_of(&user1), 0);
         assert_eq!(client.total_supply(), 0);
+
     }
 }
