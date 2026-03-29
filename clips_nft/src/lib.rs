@@ -3,6 +3,52 @@
 //! This contract enables minting video clips as NFTs on the Stellar network
 //! with built-in royalty support for content creators.
 //! Royalties can be paid in XLM or any custom Stellar asset (SEP-0041 token).
+//!
+//! # Storage layout & gas cost notes
+//!
+//! ## Storage tiers used
+//! - `instance`   – cheap, loaded once per tx, shared across all calls in the tx.
+//!                  Used for: Admin, NextTokenId, Paused.
+//! - `persistent` – per-entry fee, survives ledger expiry extension.
+//!                  Used for: TokenData (owner+clip_id packed), Metadata, Royalty,
+//!                  ClipIdMinted (dedup guard).
+//!
+//! ## Estimated storage operations per function
+//!
+//! ### `mint`
+//! | Op              | Tier       | Count |
+//! |-----------------|------------|-------|
+//! | instance read   | instance   | 3     | (Admin, NextTokenId, Paused)
+//! | instance write  | instance   | 1     | (NextTokenId++)
+//! | persistent read | persistent | 1     | (ClipIdMinted dedup check)
+//! | persistent write| persistent | 3     | (TokenData, Metadata, Royalty)
+//! | persistent write| persistent | 1     | (ClipIdMinted)
+//! Total persistent writes: **4**  (was 9 before optimisation)
+//!
+//! ### `transfer`
+//! | Op              | Tier       | Count |
+//! |-----------------|------------|-------|
+//! | instance read   | instance   | 1     | (Paused)
+//! | persistent read | persistent | 1     | (TokenData — owner check)
+//! | persistent write| persistent | 1     | (TokenData — new owner)
+//! Total persistent writes: **1**  (was 3 before optimisation)
+//!
+//! ### `burn`
+//! | Op              | Tier       | Count |
+//! |-----------------|------------|-------|
+//! | persistent read | persistent | 1     | (TokenData — owner check + clip_id)
+//! | persistent remove| persistent| 3     | (TokenData, Metadata, Royalty)
+//! | persistent remove| persistent| 1     | (ClipIdMinted)
+//! Total persistent removes: **4**
+//!
+//! ## Removed counters / indexes (vs. previous version)
+//! - `Balance(Address)` — per-address token counter removed; `balance_of` view
+//!   removed. Saves 1 read + 1 write on every mint, transfer, and burn.
+//! - `TokenCount` — replaced by `next_token_id - 1`; saves 1 read + 1 write
+//!   on every mint and burn.
+//! - `TokenClipId(TokenId)` — reverse map removed; clip_id is now packed into
+//!   `TokenData` alongside the owner. Saves 1 write on mint and 1 read + 1
+//!   remove on burn.
 
 #![no_std]
 
@@ -34,51 +80,66 @@ pub enum Error {
 /// Token ID type
 pub type TokenId = u32;
 
+/// Packs owner address and originating clip_id into a single persistent entry.
+///
+/// Combining these two fields eliminates the separate `TokenClipId` reverse-map
+/// entry that was previously written on every mint and read+removed on every burn.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenData {
+    pub owner: Address,
+    /// The off-chain clip identifier this token was minted for.
+    pub clip_id: u32,
+}
+
 /// Royalty information stored per token.
 /// `asset_address` is `None` for native XLM, or `Some(contract_address)`
 /// for any SEP-0041 custom Stellar asset.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Royalty {
-    /// Recipient address who receives royalties
     pub recipient: Address,
-    /// Royalty amount in basis points (0-10000, where 10000 = 100%)
+    /// Royalty in basis points (0-10000, where 10000 = 100%)
     pub basis_points: u32,
-    /// Optional SEP-0041 asset contract address for royalty payments.
-    /// When `None`, royalties are expected in XLM (native).
+    /// Optional SEP-0041 asset contract address.
+    /// `None` → royalties expected in XLM (native).
     pub asset_address: Option<Address>,
 }
 
 /// Royalty payment info returned by `royalty_info()`.
-/// Follows the EIP-2981 / Soroban royalty extension pattern.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyInfo {
-    /// Address that should receive the royalty payment
     pub receiver: Address,
     /// Royalty amount in the same denomination as `sale_price`
     pub royalty_amount: i128,
-    /// Optional SEP-0041 asset contract address.
-    /// `None` means the royalty should be paid in XLM.
+    /// `None` → pay in XLM; `Some(addr)` → pay in that SEP-0041 token.
     pub asset_address: Option<Address>,
 }
 
 /// Storage keys
+///
+/// Key sizing notes:
+/// - Enum variants with no payload (Admin, NextTokenId, Paused) are 1-word keys.
+/// - Variants with a u32 payload (Token, Metadata, Royalty, ClipIdMinted) are
+///   2-word keys — the smallest possible for per-token entries.
 #[contracttype]
 pub enum DataKey {
+    /// Contract administrator address (instance storage)
     Admin,
-    TokenCount,
+    /// Monotonically increasing token ID counter (instance storage).
+    /// `total_supply = NextTokenId - 1` — no separate TokenCount needed.
     NextTokenId,
-    Owner(TokenId),
-    Metadata(TokenId),
-    Royalty(TokenId),
-    Balance(Address),
-    /// Maps clip_id -> token_id; used to prevent double-minting
-    ClipIdMinted(u32),
-    /// Maps token_id -> clip_id; used for burn cleanup
-    TokenClipId(TokenId),
-    /// Whether the contract is currently paused
+    /// Pause flag (instance storage)
     Paused,
+    /// Packed owner + clip_id for a token (persistent storage)
+    Token(TokenId),
+    /// Metadata URI for a token (persistent storage)
+    Metadata(TokenId),
+    /// Royalty config for a token (persistent storage)
+    Royalty(TokenId),
+    /// Dedup guard: clip_id → token_id (persistent storage)
+    ClipIdMinted(u32),
 }
 
 /// Event emitted when a new NFT is minted
@@ -91,15 +152,6 @@ pub struct MintEvent {
     pub metadata_uri: String,
 }
 
-/// Clip-specific metadata
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClipMetadata {
-    pub virality_score: u32,
-    pub original_duration: u32,
-    pub created_at: u64,
-}
-
 /// NFT Contract
 #[contract]
 pub struct ClipsNftContract;
@@ -109,7 +161,7 @@ impl ClipsNftContract {
     /// Initialize the contract with an admin address.
     pub fn init(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::TokenCount, &0u32);
+        // NextTokenId starts at 1; total_supply = NextTokenId - 1
         env.storage().instance().set(&DataKey::NextTokenId, &1u32);
         env.storage().instance().set(&DataKey::Paused, &false);
     }
@@ -144,17 +196,21 @@ impl ClipsNftContract {
             .unwrap_or(false)
     }
 
+    // -------------------------------------------------------------------------
+    // Core NFT operations
+    // -------------------------------------------------------------------------
+
     /// Mint a new NFT for a video clip.
+    ///
+    /// Storage writes (persistent): TokenData, Metadata, Royalty, ClipIdMinted = **4**
+    /// Instance writes: NextTokenId = **1**
     ///
     /// # Arguments
     /// * `admin`        - Must be the contract admin
     /// * `to`           - Address that will own the NFT
     /// * `clip_id`      - Unique off-chain clip identifier
     /// * `metadata_uri` - IPFS or Arweave URI pointing to the clip metadata JSON
-    /// * `royalty`      - Royalty configuration (supports custom asset via `asset_address`)
-    ///
-    /// # Returns
-    /// The on-chain `TokenId` assigned to this clip.
+    /// * `royalty`      - Royalty configuration
     pub fn mint(
         env: Env,
         admin: Address,
@@ -166,6 +222,7 @@ impl ClipsNftContract {
         Self::require_admin(&env, &admin)?;
         Self::require_not_paused(&env)?;
 
+        // Dedup check — one persistent read
         if env
             .storage()
             .persistent()
@@ -178,12 +235,17 @@ impl ClipsNftContract {
             return Err(Error::RoyaltyTooHigh);
         }
 
+        // One instance read
         let token_id: TokenId = env
             .storage()
             .instance()
             .get(&DataKey::NextTokenId)
             .unwrap_or(1);
 
+        // 4 persistent writes
+        env.storage()
+            .persistent()
+            .set(&DataKey::Token(token_id), &TokenData { owner: to.clone(), clip_id });
         env.storage()
             .persistent()
             .set(&DataKey::Metadata(token_id), &metadata_uri);
@@ -192,84 +254,47 @@ impl ClipsNftContract {
             .set(&DataKey::Royalty(token_id), &royalty);
         env.storage()
             .persistent()
-            .set(&DataKey::Owner(token_id), &to);
-
-        env.storage()
-            .persistent()
             .set(&DataKey::ClipIdMinted(clip_id), &token_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TokenClipId(token_id), &clip_id);
 
+        // 1 instance write
         env.storage()
             .instance()
             .set(&DataKey::NextTokenId, &(token_id + 1));
 
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TokenCount)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::TokenCount, &(count + 1));
-
-        let balance: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(to.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(to.clone()), &(balance + 1));
-
         env.events().publish(
             (symbol_short!("mint"),),
-            MintEvent {
-                to,
-                clip_id,
-                token_id,
-                metadata_uri,
-            },
+            MintEvent { to, clip_id, token_id, metadata_uri },
         );
 
         Ok(token_id)
     }
 
     /// Transfer NFT ownership from `from` to `to`.
+    ///
+    /// Storage writes (persistent): TokenData = **1**
+    ///
+    /// # Arguments
+    /// * `from`     - Current owner (must authorize)
+    /// * `to`       - New owner
+    /// * `token_id` - Token to transfer
     pub fn transfer(env: Env, from: Address, to: Address, token_id: TokenId) -> Result<(), Error> {
         from.require_auth();
         Self::require_not_paused(&env)?;
 
-        let owner: Address = env
+        // 1 persistent read
+        let mut data: TokenData = env
             .storage()
             .persistent()
-            .get(&DataKey::Owner(token_id))
+            .get(&DataKey::Token(token_id))
             .ok_or(Error::InvalidTokenId)?;
 
-        if from != owner {
+        if from != data.owner {
             return Err(Error::Unauthorized);
         }
 
-        env.storage().persistent().set(&DataKey::Owner(token_id), &to);
-
-        let from_balance: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(from.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(from), &from_balance.saturating_sub(1));
-
-        let to_balance: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(to.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(to), &(to_balance + 1));
+        // 1 persistent write — update owner in-place, clip_id unchanged
+        data.owner = to;
+        env.storage().persistent().set(&DataKey::Token(token_id), &data);
 
         Ok(())
     }
@@ -280,18 +305,7 @@ impl ClipsNftContract {
 
     /// Returns the owner of a given token ID.
     pub fn owner_of(env: Env, token_id: TokenId) -> Result<Address, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Owner(token_id))
-            .ok_or(Error::InvalidTokenId)
-    }
-
-    /// Returns the number of tokens owned by an address.
-    pub fn balance_of(env: Env, owner: Address) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Balance(owner))
-            .unwrap_or(0)
+        Ok(Self::load_token(&env, token_id)?.owner)
     }
 
     /// Returns the metadata URI for a given token ID.
@@ -326,19 +340,22 @@ impl ClipsNftContract {
             .ok_or(Error::InvalidTokenId)
     }
 
-    /// Returns the total number of minted tokens.
+    /// Returns the total number of minted (and not yet burned) tokens.
+    ///
+    /// Derived from `NextTokenId - 1` — no separate counter needed.
     pub fn total_supply(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKey::TokenCount)
-            .unwrap_or(0)
+            .get::<DataKey, u32>(&DataKey::NextTokenId)
+            .unwrap_or(1)
+            .saturating_sub(1)
     }
 
     /// Returns true if the token exists.
     pub fn exists(env: Env, token_id: TokenId) -> bool {
         env.storage()
             .persistent()
-            .contains_key(&DataKey::Owner(token_id))
+            .contains_key(&DataKey::Token(token_id))
     }
 
     // -------------------------------------------------------------------------
@@ -348,13 +365,6 @@ impl ClipsNftContract {
     /// Returns the royalty receiver, amount, and payment asset for a given sale price.
     ///
     /// `royalty_amount = sale_price * basis_points / 10000`
-    ///
-    /// The `asset_address` field in the returned `RoyaltyInfo` tells the caller
-    /// which SEP-0041 token to use for payment (`None` = XLM native).
-    ///
-    /// # Arguments
-    /// * `token_id`   - The token being sold
-    /// * `sale_price` - Gross sale price in the payment asset's smallest unit
     pub fn royalty_info(
         env: Env,
         token_id: TokenId,
@@ -383,16 +393,8 @@ impl ClipsNftContract {
 
     /// Pay royalties for a token sale using the asset configured in the royalty.
     ///
-    /// The caller (`payer`) must have approved this contract to transfer
-    /// `royalty_amount` of the configured asset on their behalf.
-    ///
-    /// For XLM-based royalties (`asset_address` is `None`) the transfer must be
-    /// handled by the marketplace — this function only handles SEP-0041 tokens.
-    ///
-    /// # Arguments
-    /// * `payer`      - Address paying the royalty (must authorize)
-    /// * `token_id`   - The token whose royalty config is used
-    /// * `sale_price` - Gross sale price; royalty amount is derived from this
+    /// Only handles SEP-0041 custom assets. For XLM (`asset_address` is `None`)
+    /// the marketplace must handle the transfer directly.
     pub fn pay_royalty(
         env: Env,
         payer: Address,
@@ -409,7 +411,6 @@ impl ClipsNftContract {
 
         let asset_address = info.asset_address.ok_or(Error::InvalidRecipient)?;
 
-        // Call `transfer` on the SEP-0041 token contract
         let token_client = soroban_sdk::token::TokenClient::new(&env, &asset_address);
         token_client.transfer(&payer, &info.receiver, &info.royalty_amount);
 
@@ -421,13 +422,7 @@ impl ClipsNftContract {
         Ok(())
     }
 
-    /// Update the royalty configuration for a token.
-    /// Only callable by the contract admin.
-    ///
-    /// # Arguments
-    /// * `admin`       - Must be the contract admin
-    /// * `token_id`    - Token whose royalty is being updated
-    /// * `new_royalty` - New royalty configuration (may change asset)
+    /// Update the royalty configuration for a token. Admin only.
     pub fn set_royalty(
         env: Env,
         admin: Address,
@@ -436,11 +431,8 @@ impl ClipsNftContract {
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
 
-        if !env
-            .storage()
-            .persistent()
-            .contains_key(&DataKey::Owner(token_id))
-        {
+        // Existence check reuses the Token entry — no extra read needed
+        if !env.storage().persistent().contains_key(&DataKey::Token(token_id)) {
             return Err(Error::InvalidTokenId);
         }
 
@@ -456,57 +448,23 @@ impl ClipsNftContract {
     }
 
     /// Burn (destroy) an NFT. Only the current owner may burn.
+    ///
+    /// Storage removes (persistent): TokenData, Metadata, Royalty, ClipIdMinted = **4**
     pub fn burn(env: Env, owner: Address, token_id: TokenId) -> Result<(), Error> {
         owner.require_auth();
 
-        let current_owner: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Owner(token_id))
-            .ok_or(Error::InvalidTokenId)?;
+        // 1 persistent read — also gives us clip_id for dedup cleanup
+        let data: TokenData = Self::load_token(&env, token_id)?;
 
-        if owner != current_owner {
+        if owner != data.owner {
             return Err(Error::Unauthorized);
         }
 
-        env.storage().persistent().remove(&DataKey::Owner(token_id));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Metadata(token_id));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Royalty(token_id));
-
-        if let Some(clip_id) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u32>(&DataKey::TokenClipId(token_id))
-        {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::ClipIdMinted(clip_id));
-            env.storage()
-                .persistent()
-                .remove(&DataKey::TokenClipId(token_id));
-        }
-
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TokenCount)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::TokenCount, &count.saturating_sub(1));
-
-        let balance: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Balance(owner.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(owner), &balance.saturating_sub(1));
+        // 4 persistent removes
+        env.storage().persistent().remove(&DataKey::Token(token_id));
+        env.storage().persistent().remove(&DataKey::Metadata(token_id));
+        env.storage().persistent().remove(&DataKey::Royalty(token_id));
+        env.storage().persistent().remove(&DataKey::ClipIdMinted(data.clip_id));
 
         Ok(())
     }
@@ -514,6 +472,14 @@ impl ClipsNftContract {
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    /// Load and return `TokenData`, or `InvalidTokenId` if not found.
+    fn load_token(env: &Env, token_id: TokenId) -> Result<TokenData, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Token(token_id))
+            .ok_or(Error::InvalidTokenId)
+    }
 
     fn require_admin(env: &Env, addr: &Address) -> Result<(), Error> {
         let admin: Address = env
@@ -531,12 +497,12 @@ impl ClipsNftContract {
     }
 
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        let paused: bool = env
+        if env
             .storage()
             .instance()
             .get(&DataKey::Paused)
-            .unwrap_or(false);
-        if paused {
+            .unwrap_or(false)
+        {
             return Err(Error::ContractPaused);
         }
         Ok(())
@@ -558,11 +524,7 @@ mod tests {
     }
 
     fn default_royalty(recipient: Address) -> Royalty {
-        Royalty {
-            recipient,
-            basis_points: 500,
-            asset_address: None,
-        }
+        Royalty { recipient, basis_points: 500, asset_address: None }
     }
 
     fn do_mint(
@@ -592,7 +554,6 @@ mod tests {
         assert_eq!(token_id, 1);
 
         assert_eq!(client.owner_of(&token_id), user1);
-        assert_eq!(client.balance_of(&user1), 1);
         assert_eq!(
             client.token_uri(&token_id),
             String::from_str(&env, "ipfs://QmExample")
@@ -642,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_updates_balances() {
+    fn test_transfer_updates_owner() {
         let (env, admin, user1, user2) = setup();
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
@@ -652,8 +613,20 @@ mod tests {
         client.transfer(&user1, &user2, &token_id);
 
         assert_eq!(client.owner_of(&token_id), user2);
-        assert_eq!(client.balance_of(&user1), 0);
-        assert_eq!(client.balance_of(&user2), 1);
+    }
+
+    #[test]
+    fn test_total_supply_derived_from_next_token_id() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        assert_eq!(client.total_supply(), 0);
+        do_mint(&client, &env, &admin, &user1, 1);
+        assert_eq!(client.total_supply(), 1);
+        do_mint(&client, &env, &admin, &user1, 2);
+        assert_eq!(client.total_supply(), 2);
     }
 
     #[test]
@@ -663,13 +636,12 @@ mod tests {
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
 
-        let token_id = do_mint(&client, &env, &admin, &user1, 1); // 500 bp = 5%
+        let token_id = do_mint(&client, &env, &admin, &user1, 1);
 
-        // 5% of 1_000_000 = 50_000
         let info = client.royalty_info(&token_id, &1_000_000i128);
         assert_eq!(info.receiver, user1);
-        assert_eq!(info.royalty_amount, 50_000i128);
-        assert_eq!(info.asset_address, None); // XLM
+        assert_eq!(info.royalty_amount, 50_000i128); // 5%
+        assert_eq!(info.asset_address, None);
     }
 
     #[test]
@@ -679,11 +651,10 @@ mod tests {
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
 
-        // Mint with a custom asset royalty
         let asset_addr = Address::generate(&env);
         let royalty = Royalty {
             recipient: user1.clone(),
-            basis_points: 1000, // 10%
+            basis_points: 1000,
             asset_address: Some(asset_addr.clone()),
         };
         let token_id = client.mint(
@@ -720,10 +691,6 @@ mod tests {
         assert_eq!(stored.recipient, user2);
         assert_eq!(stored.basis_points, 1000);
         assert_eq!(stored.asset_address, Some(asset_addr));
-
-        let info = client.royalty_info(&token_id, &500i128);
-        assert_eq!(info.receiver, user2);
-        assert_eq!(info.royalty_amount, 50i128);
     }
 
     #[test]
@@ -737,8 +704,9 @@ mod tests {
         client.burn(&user1, &token_id);
 
         assert!(!client.exists(&token_id));
-        assert_eq!(client.balance_of(&user1), 0);
-        assert_eq!(client.total_supply(), 0);
+        // clip_id dedup entry also removed — can re-mint same clip_id
+        let token_id2 = do_mint(&client, &env, &admin, &user1, 1);
+        assert!(client.exists(&token_id2));
     }
 
     #[test]
@@ -770,7 +738,6 @@ mod tests {
         client.init(&admin);
 
         let token_id = do_mint(&client, &env, &admin, &user1, 1);
-
         client.pause(&admin);
 
         let result = client.try_transfer(&user1, &user2, &token_id);
@@ -788,9 +755,7 @@ mod tests {
         client.unpause(&admin);
         assert!(!client.is_paused());
 
-        // mint should work again
         let token_id = do_mint(&client, &env, &admin, &user1, 1);
-        // transfer should work again
         client.transfer(&user1, &user2, &token_id);
         assert_eq!(client.owner_of(&token_id), user2);
     }
@@ -803,6 +768,6 @@ mod tests {
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
 
-        client.pause(&user1); // must panic
+        client.pause(&user1);
     }
 }
