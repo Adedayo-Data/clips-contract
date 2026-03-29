@@ -53,24 +53,6 @@ pub struct RoyaltyInfo {
     pub royalty_amount: i128,
 }
 
-/// NFT metadata
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TokenMetadata {
-    /// Title of the clip
-    pub title: String,
-    /// Description of the clip
-    pub description: String,
-    /// IPFS or HTTP URL to the clip media
-    pub media_url: String,
-    /// IPFS or HTTP URL to the thumbnail
-    pub thumbnail_url: String,
-    /// Creator/owner of the clip
-    pub creator: Address,
-    /// Timestamp when created
-    pub created_at: u64,
-}
-
 /// Storage keys
 #[contracttype]
 pub enum DataKey {
@@ -485,36 +467,35 @@ mod tests {
         (env, admin, user1, user2)
     }
 
-    fn default_metadata(env: &Env, creator: Address) -> TokenMetadata {
-        TokenMetadata {
-            title: String::from_str(env, "My Clip"),
-            description: String::from_str(env, "A viral moment"),
-            media_url: String::from_str(env, "ipfs://QmExample"),
-            thumbnail_url: String::from_str(env, "ipfs://QmThumb"),
-            creator,
-            created_at: 1000,
-        }
-    }
-
-    fn default_royalty(env: &Env, recipient: Address) -> Royalty {
-        let _ = env;
+    fn default_royalty(recipient: Address) -> Royalty {
         Royalty { recipient, basis_points: 500 }
     }
 
+    /// Helper: mint clip 1 to user1 with a standard URI
+    fn do_mint(
+        client: &ClipsNftContractClient,
+        env: &Env,
+        admin: &Address,
+        to: &Address,
+        clip_id: u32,
+    ) -> TokenId {
+        client.mint(
+            admin,
+            to,
+            &clip_id,
+            &String::from_str(env, "ipfs://QmExample"),
+            &default_royalty(to.clone()),
+        )
+    }
+
     #[test]
-    fn test_init_and_mint() {
+    fn test_mint_stores_owner_and_uri() {
         let (env, admin, user1, _) = setup();
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
-
         client.init(&admin);
 
-        let token_id = client.mint(
-            &admin,
-            &user1,
-            &default_metadata(&env, user1.clone()),
-            &default_royalty(&env, user1.clone()),
-        );
+        let token_id = do_mint(&client, &env, &admin, &user1, 42);
         assert_eq!(token_id, 1);
 
         assert_eq!(client.owner_of(&token_id), user1);
@@ -527,19 +508,56 @@ mod tests {
     }
 
     #[test]
+    fn test_clip_token_id_lookup() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let token_id = do_mint(&client, &env, &admin, &user1, 99);
+        assert_eq!(client.clip_token_id(&99), token_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_double_mint_same_clip_id_panics() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        do_mint(&client, &env, &admin, &user1, 7);
+        // Second mint with same clip_id must fail
+        do_mint(&client, &env, &admin, &user1, 7);
+    }
+
+    #[test]
+    fn test_mint_emits_event() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let token_id = do_mint(&client, &env, &admin, &user1, 5);
+
+        let events = env.events().all();
+        // The last event should be our mint event
+        assert!(!events.is_empty());
+        let (_, _, event_data): (_, soroban_sdk::Vec<soroban_sdk::Val>, MintEvent) =
+            events.last().unwrap();
+        assert_eq!(event_data.clip_id, 5);
+        assert_eq!(event_data.token_id, token_id);
+        assert_eq!(event_data.to, user1);
+    }
+
+    #[test]
     fn test_transfer_updates_balances() {
         let (env, admin, user1, user2) = setup();
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
-
         client.init(&admin);
-        let token_id = client.mint(
-            &admin,
-            &user1,
-            &default_metadata(&env, user1.clone()),
-            &default_royalty(&env, user1.clone()),
-        );
 
+        let token_id = do_mint(&client, &env, &admin, &user1, 1);
         client.transfer(&user1, &user2, &token_id);
 
         assert_eq!(client.owner_of(&token_id), user2);
@@ -552,21 +570,15 @@ mod tests {
         let (env, admin, user1, user2) = setup();
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
-
         client.init(&admin);
-        let token_id = client.mint(
-            &admin,
-            &user1,
-            &default_metadata(&env, user1.clone()),
-            &default_royalty(&env, user1.clone()), // 500 bp = 5%
-        );
+
+        let token_id = do_mint(&client, &env, &admin, &user1, 1); // 500 bp = 5%
 
         // 5% of 1_000_000 = 50_000
         let info = client.royalty_info(&token_id, &1_000_000i128);
         assert_eq!(info.receiver, user1);
         assert_eq!(info.royalty_amount, 50_000i128);
 
-        // Zero royalty edge case
         let zero_royalty = Royalty { recipient: user1.clone(), basis_points: 0 };
         client.set_royalty(&admin, &token_id, &zero_royalty);
         let info2 = client.royalty_info(&token_id, &1_000_000i128);
@@ -578,16 +590,10 @@ mod tests {
         let (env, admin, user1, user2) = setup();
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
-
         client.init(&admin);
-        let token_id = client.mint(
-            &admin,
-            &user1,
-            &default_metadata(&env, user1.clone()),
-            &default_royalty(&env, user1.clone()),
-        );
 
-        // Update royalty to 10% going to user2
+        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+
         let new_royalty = Royalty { recipient: user2.clone(), basis_points: 1000 };
         client.set_royalty(&admin, &token_id, &new_royalty);
 
@@ -595,25 +601,19 @@ mod tests {
         assert_eq!(stored.recipient, user2);
         assert_eq!(stored.basis_points, 1000);
 
-        // Verify royalty_info reflects the update: 10% of 500 = 50
         let info = client.royalty_info(&token_id, &500i128);
         assert_eq!(info.receiver, user2);
         assert_eq!(info.royalty_amount, 50i128);
     }
 
     #[test]
-    fn test_burn() {        let (env, admin, user1, _) = setup();
+    fn test_burn() {
+        let (env, admin, user1, _) = setup();
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
-
         client.init(&admin);
-        let token_id = client.mint(
-            &admin,
-            &user1,
-            &default_metadata(&env, user1.clone()),
-            &default_royalty(&env, user1.clone()),
-        );
 
+        let token_id = do_mint(&client, &env, &admin, &user1, 1);
         client.burn(&user1, &token_id);
 
         assert!(!client.exists(&token_id));
