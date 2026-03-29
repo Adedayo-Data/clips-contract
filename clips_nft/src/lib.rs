@@ -7,7 +7,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype,
-    Address, Env, String, Symbol,
+    Address, Env, String,
 };
 
 /// Custom errors for the NFT contract
@@ -24,6 +24,8 @@ pub enum Error {
     RoyaltyTooHigh = 4,
     /// Invalid recipient
     InvalidRecipient = 5,
+    /// Sale price must be greater than zero
+    InvalidSalePrice = 6,
 }
 
 /// Token ID type (u32 for ERC721-like compatibility)
@@ -37,6 +39,18 @@ pub struct Royalty {
     pub recipient: Address,
     /// Royalty amount in basis points (0-10000, where 10000 = 100%)
     pub basis_points: u32,
+}
+
+/// Royalty payment info returned by royalty_info()
+/// Follows the EIP-2981 / Soroban royalty extension pattern:
+/// given a sale price, returns who to pay and how much.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyInfo {
+    /// Address that should receive the royalty payment
+    pub receiver: Address,
+    /// Royalty amount in the same denomination as sale_price
+    pub royalty_amount: i128,
 }
 
 /// NFT metadata
@@ -222,6 +236,76 @@ impl ClipsNftContract {
             .ok_or(Error::InvalidTokenId)
     }
 
+    // -------------------------------------------------------------------------
+    // Royalty extension (EIP-2981 style)
+    // -------------------------------------------------------------------------
+
+    /// Returns the royalty receiver and amount for a given sale price.
+    ///
+    /// This is the standard royalty query used by marketplaces:
+    ///   royalty_amount = sale_price * basis_points / 10000
+    ///
+    /// # Arguments
+    /// * `token_id`   - The token being sold
+    /// * `sale_price` - The gross sale price in the payment token's smallest unit
+    pub fn royalty_info(
+        env: Env,
+        token_id: TokenId,
+        sale_price: i128,
+    ) -> Result<RoyaltyInfo, Error> {
+        if sale_price <= 0 {
+            return Err(Error::InvalidSalePrice);
+        }
+
+        let royalty: Royalty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Royalty(token_id))
+            .ok_or(Error::InvalidTokenId)?;
+
+        // basis_points / 10000 * sale_price, using integer arithmetic to avoid
+        // floating point. Soroban has no f64, so we do: amount = price * bp / 10000
+        let royalty_amount = sale_price
+            .saturating_mul(royalty.basis_points as i128)
+            / 10_000;
+
+        Ok(RoyaltyInfo {
+            receiver: royalty.recipient,
+            royalty_amount,
+        })
+    }
+
+    /// Update the royalty configuration for a token.
+    /// Only callable by the contract admin.
+    ///
+    /// # Arguments
+    /// * `admin`      - Must be the contract admin
+    /// * `token_id`   - Token whose royalty is being updated
+    /// * `new_royalty` - New royalty configuration
+    pub fn set_royalty(
+        env: Env,
+        admin: Address,
+        token_id: TokenId,
+        new_royalty: Royalty,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+
+        // Token must exist
+        if !env.storage().persistent().contains_key(&DataKey::Owner(token_id)) {
+            return Err(Error::InvalidTokenId);
+        }
+
+        if new_royalty.basis_points > 10000 {
+            return Err(Error::RoyaltyTooHigh);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Royalty(token_id), &new_royalty);
+
+        Ok(())
+    }
+
     /// Get total supply
     pub fn total_supply(env: Env) -> u32 {
         env.storage()
@@ -373,8 +457,61 @@ mod tests {
     }
 
     #[test]
-    fn test_burn() {
-        let (env, admin, user1, _) = setup();
+    fn test_royalty_info() {
+        let (env, admin, user1, user2) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        let token_id = client.mint(
+            &admin,
+            &user1,
+            &default_metadata(&env, user1.clone()),
+            &default_royalty(&env, user1.clone()), // 500 bp = 5%
+        );
+
+        // 5% of 1_000_000 = 50_000
+        let info = client.royalty_info(&token_id, &1_000_000i128);
+        assert_eq!(info.receiver, user1);
+        assert_eq!(info.royalty_amount, 50_000i128);
+
+        // Zero royalty edge case
+        let zero_royalty = Royalty { recipient: user1.clone(), basis_points: 0 };
+        client.set_royalty(&admin, &token_id, &zero_royalty);
+        let info2 = client.royalty_info(&token_id, &1_000_000i128);
+        assert_eq!(info2.royalty_amount, 0i128);
+    }
+
+    #[test]
+    fn test_set_royalty() {
+        let (env, admin, user1, user2) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+
+        client.init(&admin);
+        let token_id = client.mint(
+            &admin,
+            &user1,
+            &default_metadata(&env, user1.clone()),
+            &default_royalty(&env, user1.clone()),
+        );
+
+        // Update royalty to 10% going to user2
+        let new_royalty = Royalty { recipient: user2.clone(), basis_points: 1000 };
+        client.set_royalty(&admin, &token_id, &new_royalty);
+
+        let stored = client.get_royalty(&token_id);
+        assert_eq!(stored.recipient, user2);
+        assert_eq!(stored.basis_points, 1000);
+
+        // Verify royalty_info reflects the update: 10% of 500 = 50
+        let info = client.royalty_info(&token_id, &500i128);
+        assert_eq!(info.receiver, user2);
+        assert_eq!(info.royalty_amount, 50i128);
+    }
+
+    #[test]
+    fn test_burn() {        let (env, admin, user1, _) = setup();
         let contract_id = env.register(ClipsNftContract, ());
         let client = ClipsNftContractClient::new(&env, &contract_id);
 
