@@ -27,6 +27,8 @@ pub enum Error {
     InvalidRecipient = 5,
     /// Sale price must be greater than zero
     InvalidSalePrice = 6,
+    /// Contract is paused — minting and transfers are blocked
+    ContractPaused = 7,
 }
 
 /// Token ID type
@@ -75,6 +77,8 @@ pub enum DataKey {
     ClipIdMinted(u32),
     /// Maps token_id -> clip_id; used for burn cleanup
     TokenClipId(TokenId),
+    /// Whether the contract is currently paused
+    Paused,
 }
 
 /// Event emitted when a new NFT is minted
@@ -107,6 +111,37 @@ impl ClipsNftContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::TokenCount, &0u32);
         env.storage().instance().set(&DataKey::NextTokenId, &1u32);
+        env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    // -------------------------------------------------------------------------
+    // Pausable
+    // -------------------------------------------------------------------------
+
+    /// Pause the contract. Blocks `mint` and `transfer` until unpaused.
+    /// Only callable by the admin.
+    pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("paused"),), ());
+        Ok(())
+    }
+
+    /// Unpause the contract, re-enabling `mint` and `transfer`.
+    /// Only callable by the admin.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("unpaused"),), ());
+        Ok(())
+    }
+
+    /// Returns `true` if the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     /// Mint a new NFT for a video clip.
@@ -129,6 +164,7 @@ impl ClipsNftContract {
         royalty: Royalty,
     ) -> Result<TokenId, Error> {
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         if env
             .storage()
@@ -203,6 +239,7 @@ impl ClipsNftContract {
     /// Transfer NFT ownership from `from` to `to`.
     pub fn transfer(env: Env, from: Address, to: Address, token_id: TokenId) -> Result<(), Error> {
         from.require_auth();
+        Self::require_not_paused(&env)?;
 
         let owner: Address = env
             .storage()
@@ -492,6 +529,18 @@ impl ClipsNftContract {
         addr.require_auth();
         Ok(())
     }
+
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        if paused {
+            return Err(Error::ContractPaused);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -690,5 +739,70 @@ mod tests {
         assert!(!client.exists(&token_id));
         assert_eq!(client.balance_of(&user1), 0);
         assert_eq!(client.total_supply(), 0);
+    }
+
+    #[test]
+    fn test_pause_blocks_mint() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        assert!(!client.is_paused());
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        let result = client.try_mint(
+            &admin,
+            &user1,
+            &1u32,
+            &String::from_str(&env, "ipfs://QmPaused"),
+            &default_royalty(user1.clone()),
+        );
+        assert_eq!(result, Err(Ok(Error::ContractPaused)));
+    }
+
+    #[test]
+    fn test_pause_blocks_transfer() {
+        let (env, admin, user1, user2) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+
+        client.pause(&admin);
+
+        let result = client.try_transfer(&user1, &user2, &token_id);
+        assert_eq!(result, Err(Ok(Error::ContractPaused)));
+    }
+
+    #[test]
+    fn test_unpause_restores_mint_and_transfer() {
+        let (env, admin, user1, user2) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        client.pause(&admin);
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+
+        // mint should work again
+        let token_id = do_mint(&client, &env, &admin, &user1, 1);
+        // transfer should work again
+        client.transfer(&user1, &user2, &token_id);
+        assert_eq!(client.owner_of(&token_id), user2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_non_admin_cannot_pause() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        client.pause(&user1); // must panic
     }
 }
