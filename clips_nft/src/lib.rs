@@ -7,7 +7,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype,
-    Address, Env, String,
+    symbol_short, Address, Env, String,
 };
 
 /// Custom errors for the NFT contract
@@ -81,6 +81,24 @@ pub enum DataKey {
     Metadata(TokenId),
     Royalty(TokenId),
     Balance(Address),
+    /// Maps clip_id -> token_id; used to prevent double-minting
+    ClipIdMinted(u32),
+    /// Maps token_id -> clip_id; used for burn cleanup
+    TokenClipId(TokenId),
+}
+
+/// Event emitted when a new NFT is minted
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MintEvent {
+    /// Recipient of the newly minted token
+    pub to: Address,
+    /// The clip ID that was minted
+    pub clip_id: u32,
+    /// The assigned on-chain token ID
+    pub token_id: TokenId,
+    /// Metadata URI (IPFS / Arweave)
+    pub metadata_uri: String,
 }
 
 /// NFT Contract
@@ -96,15 +114,42 @@ impl ClipsNftContract {
         env.storage().instance().set(&DataKey::NextTokenId, &1u32);
     }
 
-    /// Mint a new NFT for a video clip
+    /// Mint a new NFT for a video clip.
+    ///
+    /// Follows the NonFungibleToken mint pattern (SEP-0041 style):
+    /// the caller must be the contract admin. Each `clip_id` can only
+    /// be minted once — attempting to re-mint the same clip returns
+    /// `TokenAlreadyMinted`.
+    ///
+    /// # Arguments
+    /// * `to`           - Address that will own the NFT
+    /// * `clip_id`      - Unique off-chain clip identifier (u32)
+    /// * `metadata_uri` - IPFS or Arweave URI pointing to the clip metadata JSON
+    /// * `royalty`      - Royalty configuration for this token
+    ///
+    /// # Returns
+    /// The on-chain `TokenId` assigned to this clip.
+    ///
+    /// # Events
+    /// Emits a `(symbol_short!("mint"), MintEvent)` event on success.
     pub fn mint(
         env: Env,
         admin: Address,
         to: Address,
-        metadata: TokenMetadata,
+        clip_id: u32,
+        metadata_uri: String,
         royalty: Royalty,
     ) -> Result<TokenId, Error> {
         Self::require_admin(&env, &admin)?;
+
+        // Prevent double-minting the same clip
+        if env
+            .storage()
+            .persistent()
+            .contains_key(&DataKey::ClipIdMinted(clip_id))
+        {
+            return Err(Error::TokenAlreadyMinted);
+        }
 
         if royalty.basis_points > 10000 {
             return Err(Error::RoyaltyTooHigh);
@@ -116,16 +161,30 @@ impl ClipsNftContract {
             .get(&DataKey::NextTokenId)
             .unwrap_or(1);
 
-        env.storage().persistent().set(&DataKey::Metadata(token_id), &metadata);
-        env.storage().persistent().set(&DataKey::Royalty(token_id), &royalty);
-        env.storage().persistent().set(&DataKey::Owner(token_id), &to);
+        // Store metadata URI directly (lightweight — full JSON lives off-chain)
+        env.storage()
+            .persistent()
+            .set(&DataKey::Metadata(token_id), &metadata_uri);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Royalty(token_id), &royalty);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Owner(token_id), &to);
 
-        // Increment next token ID
+        // Mark clip_id as minted → token_id (and reverse for burn cleanup)
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClipIdMinted(clip_id), &token_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenClipId(token_id), &clip_id);
+
+        // Increment counters
         env.storage()
             .instance()
             .set(&DataKey::NextTokenId, &(token_id + 1));
 
-        // Update total token count
         let count: u32 = env
             .storage()
             .instance()
@@ -143,7 +202,18 @@ impl ClipsNftContract {
             .unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(to), &(balance + 1));
+            .set(&DataKey::Balance(to.clone()), &(balance + 1));
+
+        // Emit Mint event
+        env.events().publish(
+            (symbol_short!("mint"),),
+            MintEvent {
+                to,
+                clip_id,
+                token_id,
+                metadata_uri,
+            },
+        );
 
         Ok(token_id)
     }
@@ -206,25 +276,32 @@ impl ClipsNftContract {
             .unwrap_or(0)
     }
 
-    /// Returns the token URI (media_url from metadata) for a given token ID
+    /// Returns the token URI (metadata_uri) for a given token ID
     pub fn token_uri(env: Env, token_id: TokenId) -> Result<String, Error> {
-        let metadata: TokenMetadata = env
-            .storage()
+        env.storage()
             .persistent()
             .get(&DataKey::Metadata(token_id))
-            .ok_or(Error::InvalidTokenId)?;
-        Ok(metadata.media_url)
+            .ok_or(Error::InvalidTokenId)
     }
 
     // -------------------------------------------------------------------------
     // Additional view helpers
     // -------------------------------------------------------------------------
 
-    /// Get full token metadata
-    pub fn get_metadata(env: Env, token_id: TokenId) -> Result<TokenMetadata, Error> {
+    /// Get the metadata URI for a token (same as token_uri, kept for compatibility)
+    pub fn get_metadata(env: Env, token_id: TokenId) -> Result<String, Error> {
         env.storage()
             .persistent()
             .get(&DataKey::Metadata(token_id))
+            .ok_or(Error::InvalidTokenId)
+    }
+
+    /// Look up the on-chain token ID for a given clip_id.
+    /// Returns `InvalidTokenId` if the clip has not been minted yet.
+    pub fn clip_token_id(env: Env, clip_id: u32) -> Result<TokenId, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClipIdMinted(clip_id))
             .ok_or(Error::InvalidTokenId)
     }
 
@@ -336,6 +413,20 @@ impl ClipsNftContract {
         env.storage().persistent().remove(&DataKey::Owner(token_id));
         env.storage().persistent().remove(&DataKey::Metadata(token_id));
         env.storage().persistent().remove(&DataKey::Royalty(token_id));
+
+        // Clean up clip_id mappings so the clip can be re-minted if desired
+        if let Some(clip_id) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::TokenClipId(token_id))
+        {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ClipIdMinted(clip_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::TokenClipId(token_id));
+        }
 
         // Update total count
         let count: u32 = env
