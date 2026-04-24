@@ -31,7 +31,7 @@
 //! - `instance`   – cheap, loaded once per tx, shared across all calls in the tx.
 //!                  Used for: Admin, NextTokenId, Paused, Signer.
 //! - `persistent` – per-entry fee, survives ledger expiry extension.
-//!                  Used for: TokenData (owner+clip_id packed), Metadata, Royalty,
+//!                  Used for: TokenData (owner+clip_id+metadata+royalty packed),
 //!                  ClipIdMinted (dedup guard).
 //!
 //! ## Estimated storage operations per function
@@ -42,8 +42,8 @@
 //! | instance read   | instance   | 4     | (Admin, NextTokenId, Paused, Signer)
 //! | instance write  | instance   | 1     | (NextTokenId++)
 //! | persistent read | persistent | 1     | (ClipIdMinted dedup check)
-//! | persistent write| persistent | 4     | (TokenData, Metadata, Royalty, ClipIdMinted)
-//! Total persistent writes: **4**
+//! | persistent write| persistent | 2     | (TokenData, ClipIdMinted)
+//! Total persistent writes: **2** (Optimized from 4)
 //!
 //! ### `transfer`
 //! | Op              | Tier       | Count |
@@ -57,8 +57,8 @@
 //! | Op              | Tier       | Count |
 //! |-----------------|------------|-------|
 //! | persistent read | persistent | 1     | (TokenData — owner check + clip_id)
-//! | persistent remove| persistent| 4     | (TokenData, Metadata, Royalty, ClipIdMinted)
-//! Total persistent removes: **4**
+//! | persistent remove| persistent| 2     | (TokenData, ClipIdMinted)
+//! Total persistent removes: **2** (Optimized from 4)
 //!
 //! ## Removed counters / indexes (vs. earlier version)
 //! - `Balance(Address)` — per-address token counter removed.
@@ -108,10 +108,10 @@ pub enum Error {
 /// Token ID type
 pub type TokenId = u32;
 
-/// Packs owner address and originating clip_id into a single persistent entry.
+/// Packs owner address, originating clip_id, metadata, and royalty into a single persistent entry.
 ///
-/// Combining these two fields eliminates the separate `TokenClipId` reverse-map
-/// entry that was previously written on every mint and read+removed on every burn.
+/// Combining these fields eliminates the separate `Metadata` and `Royalty`
+/// entries that were previously written on every mint.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenData {
@@ -120,6 +120,10 @@ pub struct TokenData {
     pub clip_id: u32,
     /// Whether this token is soulbound (non-transferable)
     pub is_soulbound: bool,
+    /// Metadata URI for the token
+    pub metadata_uri: String,
+    /// Royalty configuration
+    pub royalty: Royalty,
 }
 
 /// Royalty information stored per token.
@@ -158,7 +162,7 @@ pub struct RoyaltyInfo {
 ///
 /// Key sizing notes:
 /// - Enum variants with no payload (Admin, NextTokenId, Paused) are 1-word keys.
-/// - Variants with a u32 payload (Token, Metadata, Royalty, ClipIdMinted) are
+/// - Variants with a u32 payload (Token, ClipIdMinted) are
 ///   2-word keys — the smallest possible for per-token entries.
 #[contracttype]
 pub enum DataKey {
@@ -169,12 +173,8 @@ pub enum DataKey {
     NextTokenId,
     /// Pause flag (instance storage)
     Paused,
-    /// Packed owner + clip_id for a token (persistent storage)
+    /// Packed owner + clip_id + metadata + royalty for a token (persistent storage)
     Token(TokenId),
-    /// Metadata URI for a token (persistent storage)
-    Metadata(TokenId),
-    /// Royalty config for a token (persistent storage)
-    Royalty(TokenId),
     /// Dedup guard: clip_id → token_id (persistent storage)
     ClipIdMinted(u32),
     /// Ed25519 public key of the trusted backend signer (instance storage)
@@ -354,16 +354,17 @@ impl ClipsNftContract {
             .get(&DataKey::NextTokenId)
             .unwrap_or(1);
 
-        // 4 persistent writes
-        env.storage()
-            .persistent()
-            .set(&DataKey::Token(token_id), &TokenData { owner: to.clone(), clip_id, is_soulbound });
-        env.storage()
-            .persistent()
-            .set(&DataKey::Metadata(token_id), &metadata_uri);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Royalty(token_id), &royalty);
+        // 2 persistent writes (Optimized from 4)
+        env.storage().persistent().set(
+            &DataKey::Token(token_id),
+            &TokenData {
+                owner: to.clone(),
+                clip_id,
+                is_soulbound,
+                metadata_uri: metadata_uri.clone(),
+                royalty,
+            },
+        );
         env.storage()
             .persistent()
             .set(&DataKey::ClipIdMinted(clip_id), &token_id);
@@ -437,18 +438,12 @@ impl ClipsNftContract {
 
     /// Returns the metadata URI for a given token ID.
     pub fn token_uri(env: Env, token_id: TokenId) -> Result<String, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Metadata(token_id))
-            .ok_or(Error::InvalidTokenId)
+        Ok(Self::load_token(&env, token_id)?.metadata_uri)
     }
 
     /// Alias for `token_uri`, kept for compatibility.
     pub fn get_metadata(env: Env, token_id: TokenId) -> Result<String, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Metadata(token_id))
-            .ok_or(Error::InvalidTokenId)
+        Ok(Self::load_token(&env, token_id)?.metadata_uri)
     }
 
     /// Look up the on-chain token ID for a given clip_id.
@@ -461,10 +456,7 @@ impl ClipsNftContract {
 
     /// Returns the stored `Royalty` struct for a token.
     pub fn get_royalty(env: Env, token_id: TokenId) -> Result<Royalty, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Royalty(token_id))
-            .ok_or(Error::InvalidTokenId)
+        Ok(Self::load_token(&env, token_id)?.royalty)
     }
 
     /// Returns the total number of minted (and not yet burned) tokens.
@@ -513,11 +505,7 @@ impl ClipsNftContract {
             return Err(Error::InvalidSalePrice);
         }
 
-        let royalty: Royalty = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Royalty(token_id))
-            .ok_or(Error::InvalidTokenId)?;
+        let royalty = Self::load_token(&env, token_id)?.royalty;
 
         let mut total_bps: u32 = 0;
         for idx in 0..royalty.recipients.len() {
@@ -555,11 +543,7 @@ impl ClipsNftContract {
         if sale_price <= 0 {
             return Err(Error::InvalidSalePrice);
         }
-        let royalty: Royalty = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Royalty(token_id))
-            .ok_or(Error::InvalidTokenId)?;
+        let royalty = Self::load_token(&env, token_id)?.royalty;
         let asset_address = royalty.asset_address.clone().ok_or(Error::InvalidRecipient)?;
         let token_client = soroban_sdk::token::TokenClient::new(&env, &asset_address);
         let mut cumulative_bps: u32 = 0;
@@ -600,17 +584,9 @@ impl ClipsNftContract {
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
 
-        // Existence check reuses the Token entry — no extra read needed
-        if !env.storage().persistent().has(&DataKey::Token(token_id)) {
-            return Err(Error::InvalidTokenId);
-        }
-
-        // Get old royalty to emit event with old recipient
-        let old_royalty: Royalty = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Royalty(token_id))
-            .ok_or(Error::InvalidTokenId)?;
+        // 1 persistent read
+        let mut data = Self::load_token(&env, token_id)?;
+        let old_royalty = data.royalty.clone();
 
         let new_royalty = Self::normalize_royalty(&env, new_royalty)?;
 
@@ -631,16 +607,17 @@ impl ClipsNftContract {
             }
         }
 
+        data.royalty = new_royalty;
         env.storage()
             .persistent()
-            .set(&DataKey::Royalty(token_id), &new_royalty);
+            .set(&DataKey::Token(token_id), &data);
 
         Ok(())
     }
 
     /// Burn (destroy) an NFT. Only the current owner may burn.
     ///
-    /// Storage removes (persistent): TokenData, Metadata, Royalty, ClipIdMinted = **4**
+    /// Storage removes (persistent): TokenData, ClipIdMinted = **2** (Optimized from 4)
     pub fn burn(env: Env, owner: Address, token_id: TokenId) -> Result<(), Error> {
         owner.require_auth();
 
@@ -651,11 +628,11 @@ impl ClipsNftContract {
             return Err(Error::Unauthorized);
         }
 
-        // 4 persistent removes
+        // 2 persistent removes
         env.storage().persistent().remove(&DataKey::Token(token_id));
-        env.storage().persistent().remove(&DataKey::Metadata(token_id));
-        env.storage().persistent().remove(&DataKey::Royalty(token_id));
-        env.storage().persistent().remove(&DataKey::ClipIdMinted(data.clip_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ClipIdMinted(data.clip_id));
 
         env.events().publish(
             (symbol_short!("burn"),),
