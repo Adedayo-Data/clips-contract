@@ -188,23 +188,33 @@ pub enum DataKey {
     NextTokenId,
     /// Pause flag (instance storage)
     Paused,
+    /// Collection name (instance storage)
+    Name,
+    /// Collection symbol (instance storage)
+    Symbol,
     /// Packed owner + clip_id + metadata + royalty for a token (persistent storage)
     Token(TokenId),
     /// Dedup guard: clip_id → token_id (persistent storage)
     ClipIdMinted(u32),
+    /// Custom metadata URI override per token (persistent storage)
+    CustomTokenUri(TokenId),
     /// Ed25519 public key of the trusted backend signer (instance storage)
     Signer,
     /// Platform recipient used for default 1% royalty cut
     PlatformRecipient,
-    /// Collection display name (instance storage)
-    Name,
-    /// Collection ticker symbol (instance storage)
-    Symbol,
-    /// Per-token approved operator (persistent storage)
+    /// Total synthetic gas used in minting (instance storage)
+    TotalGasMint,
+    /// Total number of successful mints (instance storage)
+    CountMint,
+    /// Total synthetic gas used in transfers (instance storage)
+    TotalGasTransfer,
+    /// Total number of successful transfers (instance storage)
+    CountTransfer,
+    /// Per-token approval: token_id -> operator
     Approved(TokenId),
-    /// Operator approved for all tokens of owner (persistent storage)
+    /// Operator approval for all: (owner, operator) -> bool
     ApprovalForAll(Address, Address),
-    /// Blacklist flag for clip IDs (persistent storage)
+    /// Blacklist flag for a clip_id
     BlacklistedClip(u32),
 }
 
@@ -253,6 +263,31 @@ pub struct ApprovalEvent {
 }
 
 /// Event emitted when approval-for-all is set or revoked.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalForAllEvent {
+    pub owner: Address,
+    pub operator: Address,
+    pub approved: bool,
+}
+
+/// Event emitted when a clip ID is blacklisted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlacklistEvent {
+    pub clip_id: u32,
+}
+
+/// Event emitted when token approval changes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalEvent {
+    pub owner: Address,
+    pub operator: Address,
+    pub token_id: TokenId,
+}
+
+/// Event emitted when operator-for-all approval changes.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalForAllEvent {
@@ -645,9 +680,10 @@ impl ClipsNftContract {
 
         data.owner = to.clone();
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
+        let gas_used = GAS_BASE_TRANSFER;
         env.events().publish(
             (symbol_short!("transfer"),),
-            TransferEvent { token_id, from, to },
+            TransferEvent { token_id, from, to, gas_used },
         );
 
         Ok(())
@@ -670,6 +706,28 @@ impl ClipsNftContract {
     pub fn set_symbol(env: Env, admin: Address, symbol: String) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::Symbol, &symbol);
+        Ok(())
+    }
+
+    /// Set a custom token URI for a minted token. Only the token owner can update it.
+    pub fn set_token_uri(
+        env: Env,
+        owner: Address,
+        token_id: TokenId,
+        uri: String,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+
+        let data = Self::load_token(&env, token_id)?;
+        if data.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut data = data;
+        data.metadata_uri = uri;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Token(token_id), &data);
         Ok(())
     }
 
@@ -1156,6 +1214,41 @@ mod tests {
             String::from_str(&env, "ipfs://QmExample")
         );
         assert_eq!(client.total_supply(), 1);
+    }
+
+    #[test]
+    fn test_set_token_uri_owner_only_and_precedence() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        let token_id = do_mint(&client, &env, &user1, 4242, &kp);
+        let custom_uri = String::from_str(&env, "ipfs://QmCustomOverride");
+
+        client.set_token_uri(&user1, &token_id, &custom_uri);
+
+        assert_eq!(client.token_uri(&token_id), custom_uri.clone());
+        assert_eq!(client.get_metadata(&token_id), custom_uri);
+    }
+
+    #[test]
+    fn test_set_token_uri_non_owner_fails() {
+        let (env, admin, user1, user2) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        let token_id = do_mint(&client, &env, &user1, 4343, &kp);
+        let custom_uri = String::from_str(&env, "ipfs://QmShouldFail");
+
+        let result = client.try_set_token_uri(&user2, &token_id, &custom_uri);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+        // Original URI is still returned because override wasn't authorized.
+        assert_eq!(client.token_uri(&token_id), String::from_str(&env, "ipfs://QmExample"));
     }
 
     #[test]
