@@ -20,7 +20,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 },
                 {
-                  "bytes": "09a59c8e4ea2162dce646ac57581f86a86e653e7024fdba372f839978edae1ba"
+                  "bytes": "c340144b7603f4bda19e01de2ae3a8994d5186603f866318ece7e5fca8dca1fb"
                 }
               ]
             }
@@ -42,7 +42,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "u32": 106
+                  "u32": 600
                 },
                 {
                   "string": "ipfs://QmExample"
@@ -90,7 +90,7 @@
                   "bool": false
                 },
                 {
-                  "bytes": "bc555834b30ffeb9e81a1c54d6681bff7d34fec8357e0d72b5895bbb3c22b867b418755fef06594f7bf1f0dcb17738b514dbb56641ff005bd45d3ed4e9a5080c"
+                  "bytes": "f25f16d349c6aec82a79e34aaad478d082854bbfc64c1856317a70490aa0794fd2f8456f17cd41b9ae868e92f16d44a49bd2992d141b6ad1db071a1395654a04"
                 }
               ]
             }
@@ -99,6 +99,8 @@
         }
       ]
     ],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -164,7 +166,7 @@
                     "symbol": "ClipIdMinted"
                   },
                   {
-                    "u32": 106
+                    "u32": 600
                   }
                 ]
               },
@@ -203,7 +205,7 @@
                       "symbol": "clip_id"
                     },
                     "val": {
-                      "u32": 106
+                      "u32": 600
                     }
                   },
                   {
@@ -374,7 +376,7 @@
                         ]
                       },
                       "val": {
-                        "bytes": "09a59c8e4ea2162dce646ac57581f86a86e653e7024fdba372f839978edae1ba"
+                        "bytes": "c340144b7603f4bda19e01de2ae3a8994d5186603f866318ece7e5fca8dca1fb"
                       }
                     }
                   ]

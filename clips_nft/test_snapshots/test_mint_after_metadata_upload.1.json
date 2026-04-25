@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 4,
+    "address": 3,
     "nonce": 0,
     "mux_id": 0
   },
@@ -13,14 +13,14 @@
         {
           "function": {
             "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "function_name": "set_signer",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                 },
                 {
-                  "bytes": "09a59c8e4ea2162dce646ac57581f86a86e653e7024fdba372f839978edae1ba"
+                  "bytes": "b4693057ee2db84728e7894d362643a55b0ee3df6b1f035a6a1207926d29a162"
                 }
               ]
             }
@@ -31,21 +31,21 @@
     ],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
         {
           "function": {
             "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "function_name": "mint",
               "args": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "u32": 106
+                  "u32": 101
                 },
                 {
-                  "string": "ipfs://QmExample"
+                  "string": "ipfs://QmClip101"
                 },
                 {
                   "map": [
@@ -68,7 +68,7 @@
                                   "symbol": "basis_points"
                                 },
                                 "val": {
-                                  "u32": 500
+                                  "u32": 1000
                                 }
                               },
                               {
@@ -76,7 +76,7 @@
                                   "symbol": "recipient"
                                 },
                                 "val": {
-                                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                                 }
                               }
                             ]
@@ -90,7 +90,7 @@
                   "bool": false
                 },
                 {
-                  "bytes": "bc555834b30ffeb9e81a1c54d6681bff7d34fec8357e0d72b5895bbb3c22b867b418755fef06594f7bf1f0dcb17738b514dbb56641ff005bd45d3ed4e9a5080c"
+                  "bytes": "dd9ac097bf1d0c95042676f356d39c7141e02acb83d25c82e376c1d0d5d6594d020eaa8e082414b1c8778b425e82864957bd52d28be4e9a31d035b2e26916302"
                 }
               ]
             }
@@ -99,6 +99,8 @@
         }
       ]
     ],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -139,32 +141,12 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": {
-                "ledger_key_nonce": {
-                  "nonce": "5541220902715666415"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-              "key": {
                 "vec": [
                   {
                     "symbol": "ClipIdMinted"
                   },
                   {
-                    "u32": 106
+                    "u32": 101
                   }
                 ]
               },
@@ -184,7 +166,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": {
                 "vec": [
                   {
@@ -203,7 +185,7 @@
                       "symbol": "clip_id"
                     },
                     "val": {
-                      "u32": 106
+                      "u32": 101
                     }
                   },
                   {
@@ -219,7 +201,7 @@
                       "symbol": "metadata_uri"
                     },
                     "val": {
-                      "string": "ipfs://QmExample"
+                      "string": "ipfs://QmClip101"
                     }
                   },
                   {
@@ -227,7 +209,7 @@
                       "symbol": "owner"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                     }
                   },
                   {
@@ -255,7 +237,7 @@
                                       "symbol": "basis_points"
                                     },
                                     "val": {
-                                      "u32": 500
+                                      "u32": 1000
                                     }
                                   },
                                   {
@@ -263,7 +245,7 @@
                                       "symbol": "recipient"
                                     },
                                     "val": {
-                                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                                     }
                                   }
                                 ]
@@ -308,7 +290,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": "ledger_key_contract_instance",
               "durability": "persistent",
               "val": {
@@ -374,7 +356,7 @@
                         ]
                       },
                       "val": {
-                        "bytes": "09a59c8e4ea2162dce646ac57581f86a86e653e7024fdba372f839978edae1ba"
+                        "bytes": "b4693057ee2db84728e7894d362643a55b0ee3df6b1f035a6a1207926d29a162"
                       }
                     }
                   ]
@@ -385,6 +367,26 @@
           "ext": "v0"
         },
         "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "ledger_key_nonce": {
+                  "nonce": "5541220902715666415"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
       },
       {
         "entry": {
