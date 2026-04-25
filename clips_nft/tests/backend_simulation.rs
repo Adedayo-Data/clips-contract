@@ -163,8 +163,13 @@ fn test_error_cases() {
 
     let clip_id = 303;
     let metadata_uri = backend.upload_metadata(&env, clip_id);
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(RoyaltyRecipient {
+        recipient: user.clone(),
+        basis_points: 1000,
+    });
     let royalty = Royalty {
-        recipients: Vec::new(&env),
+        recipients,
         asset_address: None,
     };
 

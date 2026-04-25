@@ -103,6 +103,10 @@ pub enum Error {
     SoulboundTransferBlocked = 11,
     /// Royalty calculation would overflow
     RoyaltyOverflow = 12,
+    /// Clip is blacklisted
+    ClipBlacklisted = 13,
+    /// Caller is not authorized to approve
+    NotAuthorizedToApprove = 14,
 }
 
 /// Token ID type
@@ -181,6 +185,16 @@ pub enum DataKey {
     Signer,
     /// Platform recipient used for default 1% royalty cut
     PlatformRecipient,
+    /// Blacklisted clip ID (persistent storage)
+    BlacklistedClip(u32),
+    /// Token collection name (instance storage)
+    Name,
+    /// Token collection symbol (instance storage)
+    Symbol,
+    /// Approved operator for a token (persistent storage)
+    Approved(TokenId),
+    /// Approved operator for all tokens of an owner (persistent storage)
+    ApprovalForAll(Address, Address),
 }
 
 /// Event emitted when a new NFT is minted
@@ -228,6 +242,31 @@ pub struct RoyaltyRecipientUpdatedEvent {
     pub token_id: TokenId,
     pub old_recipient: Address,
     pub new_recipient: Address,
+}
+
+/// Event emitted when a clip is blacklisted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlacklistEvent {
+    pub clip_id: u32,
+}
+
+/// Event emitted when an approval is set.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalEvent {
+    pub owner: Address,
+    pub operator: Address,
+    pub token_id: TokenId,
+}
+
+/// Event emitted when an approval for all is set.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalForAllEvent {
+    pub owner: Address,
+    pub operator: Address,
+    pub approved: bool,
 }
 
 /// NFT Contract
@@ -293,6 +332,18 @@ impl ClipsNftContract {
             .unwrap_or(false)
     }
 
+    /// Blacklist a clip ID, preventing it from being minted.
+    /// Only callable by the admin.
+    pub fn blacklist_clip(env: Env, admin: Address, clip_id: u32) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::BlacklistedClip(clip_id), &true);
+        env.events()
+            .publish((symbol_short!("blacklist"),), BlacklistEvent { clip_id });
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // Core NFT operations
     // -------------------------------------------------------------------------
@@ -345,6 +396,15 @@ impl ClipsNftContract {
             return Err(Error::TokenAlreadyMinted);
         }
 
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::BlacklistedClip(clip_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::ClipBlacklisted);
+        }
+
         let royalty = Self::normalize_royalty(&env, royalty)?;
 
         // One instance read
@@ -382,6 +442,76 @@ impl ClipsNftContract {
         Ok(token_id)
     }
 
+    // -------------------------------------------------------------------------
+    // Approvals
+    // -------------------------------------------------------------------------
+
+    /// Approve an operator to transfer a specific token.
+    pub fn approve(
+        env: Env,
+        caller: Address,
+        operator: Option<Address>,
+        token_id: TokenId,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let owner = Self::owner_of(env.clone(), token_id)?;
+        
+        // Caller must be owner or approved for all
+        if caller != owner && !Self::is_approved_for_all(env.clone(), owner.clone(), caller.clone()) {
+            return Err(Error::NotAuthorizedToApprove);
+        }
+
+        if let Some(op) = operator.clone() {
+            env.storage().persistent().set(&DataKey::Approved(token_id), &op);
+            env.events().publish(
+                (symbol_short!("approve"),),
+                ApprovalEvent { owner, operator: op, token_id },
+            );
+        } else {
+            env.storage().persistent().remove(&DataKey::Approved(token_id));
+        }
+
+        Ok(())
+    }
+
+    /// Set or unset an operator to manage all of the caller's tokens.
+    pub fn set_approval_for_all(
+        env: Env,
+        caller: Address,
+        operator: Address,
+        approved: bool,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ApprovalForAll(caller.clone(), operator.clone()), &approved);
+
+        env.events().publish(
+            (symbol_short!("appr_all"),),
+            ApprovalForAllEvent { owner: caller, operator, approved },
+        );
+
+        Ok(())
+    }
+
+    /// Check if an operator is approved to manage all of the owner's tokens.
+    pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovalForAll(owner, operator))
+            .unwrap_or(false)
+    }
+
+    /// Get the approved operator for a specific token, if any.
+    pub fn get_approved(env: Env, token_id: TokenId) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Approved(token_id))
+    }
+
+
     /// Transfer NFT ownership from `from` to `to`.
     ///
     /// Blocked if the token is soulbound (non-transferable).
@@ -411,6 +541,9 @@ impl ClipsNftContract {
             return Err(Error::SoulboundTransferBlocked);
         }
 
+        // Clear approval when transferred
+        env.storage().persistent().remove(&DataKey::Approved(token_id));
+
         // 1 persistent write — update owner in-place, clip_id unchanged
         data.owner = to.clone();
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
@@ -422,6 +555,71 @@ impl ClipsNftContract {
         Ok(())
     }
 
+    /// Transfer NFT ownership from `from` to `to` by an approved `spender`.
+    pub fn transfer_from(
+        env: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        token_id: TokenId,
+    ) -> Result<(), Error> {
+        spender.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let mut data: TokenData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token(token_id))
+            .ok_or(Error::InvalidTokenId)?;
+
+        if from != data.owner {
+            return Err(Error::Unauthorized);
+        }
+
+        let is_approved_for_all = Self::is_approved_for_all(env.clone(), from.clone(), spender.clone());
+        let approved_operator = Self::get_approved(env.clone(), token_id);
+        
+        let is_approved = is_approved_for_all || approved_operator == Some(spender);
+        
+        if !is_approved {
+            return Err(Error::Unauthorized);
+        }
+
+        if data.is_soulbound {
+            return Err(Error::SoulboundTransferBlocked);
+        }
+
+        // Clear approval
+        env.storage().persistent().remove(&DataKey::Approved(token_id));
+
+        data.owner = to.clone();
+        env.storage().persistent().set(&DataKey::Token(token_id), &data);
+        env.events().publish(
+            (symbol_short!("transfer"),),
+            TransferEvent { token_id, from, to },
+        );
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Admin Configuration
+    // -------------------------------------------------------------------------
+
+    /// Set the collection name. Admin only.
+    pub fn set_name(env: Env, admin: Address, name: String) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Name, &name);
+        Ok(())
+    }
+
+    /// Set the collection symbol. Admin only.
+    pub fn set_symbol(env: Env, admin: Address, symbol: String) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Symbol, &symbol);
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // View functions
     // -------------------------------------------------------------------------
@@ -429,6 +627,27 @@ impl ClipsNftContract {
     /// Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         VERSION
+    }
+
+    /// Returns the collection name.
+    pub fn name(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Name)
+            .unwrap_or_else(|| String::from_str(&env, "ClipCash Clips"))
+    }
+
+    /// Returns the collection symbol.
+    pub fn symbol(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Symbol)
+            .unwrap_or_else(|| String::from_str(&env, "CLIP"))
+    }
+
+    /// Returns the original clip ID for a given token ID.
+    pub fn get_clip_id(env: Env, token_id: TokenId) -> Result<u32, Error> {
+        Ok(Self::load_token(&env, token_id)?.clip_id)
     }
 
     /// Returns the owner of a given token ID.
@@ -513,12 +732,7 @@ impl ClipsNftContract {
             total_bps = total_bps.saturating_add(split.basis_points);
         }
 
-        // Safe multiplication: check for overflow before multiplying
-        if sale_price > i128::MAX / (total_bps as i128) {
-            return Err(Error::RoyaltyOverflow);
-        }
-        
-        let total_royalty_amount = sale_price.saturating_mul(total_bps as i128) / 10_000;
+        let total_royalty_amount = Self::calculate_royalty(sale_price, total_bps)?;
         let first = royalty.recipients.get(0).ok_or(Error::InvalidRoyaltySplit)?;
 
         Ok(RoyaltyInfo {
@@ -552,7 +766,7 @@ impl ClipsNftContract {
             let split = royalty.recipients.get(idx).ok_or(Error::InvalidRoyaltySplit)?;
             
             cumulative_bps = cumulative_bps.saturating_add(split.basis_points);
-            let total_royalty_so_far = sale_price.saturating_mul(cumulative_bps as i128) / 10_000;
+            let total_royalty_so_far = Self::calculate_royalty(sale_price, cumulative_bps)?;
             let amount = total_royalty_so_far.saturating_sub(cumulative_royalty);
             cumulative_royalty = total_royalty_so_far;
 
@@ -761,6 +975,16 @@ impl ClipsNftContract {
             recipients,
             asset_address: royalty.asset_address,
         })
+    }
+    pub fn calculate_royalty(sale_price: i128, basis_points: u32) -> Result<i128, Error> {
+        if sale_price <= 0 {
+            return Err(Error::InvalidSalePrice);
+        }
+        if sale_price > i128::MAX / 10_000 {
+            return Err(Error::RoyaltyOverflow);
+        }
+        let amount = sale_price.saturating_mul(basis_points as i128);
+        Ok((amount.saturating_add(5_000)) / 10_000)
     }
 }
 
@@ -1586,5 +1810,127 @@ mod tests {
             let info = client.royalty_info(&token_id, price);
             assert_eq!(info.royalty_amount, *expected);
         }
+    }
+
+    #[test]
+    fn test_blacklist_clip() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        client.blacklist_clip(&admin, &300u32);
+
+        let uri = String::from_str(&env, "ipfs://QmBlacklisted");
+        let sig = sign_mint(&env, &kp, &user1, 300, &uri);
+
+        let result = client.try_mint(&user1, &300u32, &uri, &default_royalty(&env, user1.clone()), &false, &sig);
+        assert_eq!(result, Err(Ok(Error::ClipBlacklisted)));
+    }
+
+    #[test]
+    fn test_name_and_symbol() {
+        let (env, admin, _, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        assert_eq!(client.name(), String::from_str(&env, "ClipCash Clips"));
+        assert_eq!(client.symbol(), String::from_str(&env, "CLIP"));
+
+        client.set_name(&admin, &String::from_str(&env, "New Name"));
+        client.set_symbol(&admin, &String::from_str(&env, "NEW"));
+
+        assert_eq!(client.name(), String::from_str(&env, "New Name"));
+        assert_eq!(client.symbol(), String::from_str(&env, "NEW"));
+    }
+
+    #[test]
+    fn test_get_clip_id() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        let token_id = do_mint(&client, &env, &user1, 404, &kp);
+        assert_eq!(client.get_clip_id(&token_id), 404);
+    }
+
+    #[test]
+    fn test_approvals_and_transfer_from() {
+        let (env, admin, user1, user2) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        let operator = Address::generate(&env);
+        let token_id = do_mint(&client, &env, &user1, 500, &kp);
+
+        // Operator is not approved yet
+        let result = client.try_transfer_from(&operator, &user1, &user2, &token_id);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+        // Owner approves operator
+        client.approve(&user1, &Some(operator.clone()), &token_id);
+        assert_eq!(client.get_approved(&token_id), Some(operator.clone()));
+
+        // Operator transfers token
+        client.transfer_from(&operator, &user1, &user2, &token_id);
+        assert_eq!(client.owner_of(&token_id), user2);
+
+        // Approval is cleared after transfer
+        assert_eq!(client.get_approved(&token_id), None);
+    }
+
+    #[test]
+    fn test_set_approval_for_all() {
+        let (env, admin, user1, user2) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        let operator = Address::generate(&env);
+        let token_id1 = do_mint(&client, &env, &user1, 501, &kp);
+        let token_id2 = do_mint(&client, &env, &user1, 502, &kp);
+
+        client.set_approval_for_all(&user1, &operator, &true);
+        assert!(client.is_approved_for_all(&user1, &operator));
+
+        client.transfer_from(&operator, &user1, &user2, &token_id1);
+        client.transfer_from(&operator, &user1, &user2, &token_id2);
+
+        assert_eq!(client.owner_of(&token_id1), user2);
+        assert_eq!(client.owner_of(&token_id2), user2);
+    }
+
+    #[test]
+    fn test_calculate_royalty_rounding() {
+        // Proper rounding: 100 * 50 / 10000 = 0.5 -> rounds up to 1?
+        // Let's test the inner function logic directly or through contract info
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        // We know calculate_royalty is pure math, but we can test it via royalty_info
+        let token_id = do_mint(&client, &env, &user1, 600, &kp);
+
+        // Our royalty is 500 bps (5%) + 100 bps (1%) = 600 bps = 6%
+        let info1 = client.royalty_info(&token_id, &150i128);
+        // 150 * 600 / 10000 = 90000 / 10000 = 9
+        assert_eq!(info1.royalty_amount, 9i128);
+
+        let info2 = client.royalty_info(&token_id, &158i128);
+        // 158 * 600 = 94800. 94800 / 10000 = 9.48. Rounding +5000 -> 99800 / 10000 = 9
+        assert_eq!(info2.royalty_amount, 9i128);
+
+        let info3 = client.royalty_info(&token_id, &159i128);
+        // 159 * 600 = 95400. +5000 = 100400. / 10000 = 10
+        assert_eq!(info3.royalty_amount, 10i128);
     }
 }
