@@ -1,9 +1,10 @@
 # Makefile for ClipCash NFT Smart Contract
 
-WASM_TARGET  = wasm32-unknown-unknown
-PACKAGE      = clips_nft
-WASM_OUT     = target/$(WASM_TARGET)/release/$(PACKAGE).wasm
-WASM_OPT_OUT = target/$(WASM_TARGET)/release/$(PACKAGE)_optimized.wasm
+WASM_TARGET      = wasm32v1-none
+PACKAGE          = clips_nft
+WASM_OUT         = target/$(WASM_TARGET)/release/$(PACKAGE).wasm
+WASM_OPT_OUT     = target/$(WASM_TARGET)/release/$(PACKAGE)_optimized.wasm
+BINDINGS_OUT_DIR = contracts/clips_nft
 
 .PHONY: all build build-debug check test test-verbose \
         format lint clean install-deps optimize deploy verify help
@@ -52,6 +53,17 @@ optimize: build
 		{ echo "wasm-opt not found — install binaryen: https://github.com/WebAssembly/binaryen"; exit 1; }
 	wasm-opt -Oz $(WASM_OUT) -o $(WASM_OPT_OUT)
 	@echo "Optimized WASM → $(WASM_OPT_OUT)"
+
+## Generate TypeScript bindings from the compiled WASM
+bindings: build
+	@command -v stellar >/dev/null 2>&1 || \
+		{ echo "stellar CLI not found — run: cargo install --locked stellar-cli"; exit 1; }
+	stellar contract bindings typescript \
+		--wasm $(WASM_OUT) \
+		--output-dir $(BINDINGS_OUT_DIR) \
+		--overwrite
+	@echo "TypeScript bindings written to $(BINDINGS_OUT_DIR)"
+	@echo "Run: cd $(BINDINGS_OUT_DIR) && npm install && npm run build"
 
 ## Deploy to Stellar testnet (requires stellar-cli)
 deploy-testnet: build
