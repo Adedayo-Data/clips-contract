@@ -351,6 +351,10 @@ pub struct BatchMintEvent {
 #[contract]
 pub struct ClipsNftContract;
 
+/// Synthetic gas constants for tracking (approximations)
+const GAS_BASE_MINT: u64 = 50_000;
+const GAS_BASE_TRANSFER: u64 = 30_000;
+
 #[contractimpl]
 impl ClipsNftContract {
     /// Initialize the contract with an admin address.
@@ -607,6 +611,25 @@ impl ClipsNftContract {
             .instance()
             .set(&DataKey::NextTokenId, &(token_id + 1));
 
+        // Track gas usage for mint
+        let total_gas: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalGasMint)
+            .unwrap_or(0);
+        let count_mint: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CountMint)
+            .unwrap_or(0);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalGasMint, &(total_gas + GAS_BASE_MINT));
+        env.storage()
+            .instance()
+            .set(&DataKey::CountMint, &(count_mint + 1));
+
         env.events().publish(
             (symbol_short!("mint"),),
             MintEvent { to, clip_id, token_id, metadata_uri },
@@ -721,6 +744,25 @@ impl ClipsNftContract {
         data.owner = to.clone();
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
 
+        // Track gas usage for transfer
+        let total_gas: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalGasTransfer)
+            .unwrap_or(0);
+        let count_transfer: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CountTransfer)
+            .unwrap_or(0);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalGasTransfer, &(total_gas + GAS_BASE_TRANSFER));
+        env.storage()
+            .instance()
+            .set(&DataKey::CountTransfer, &(count_transfer + 1));
+
         env.events().publish(
             (symbol_short!("transfer"),),
             TransferEvent { token_id, from, to },
@@ -768,10 +810,29 @@ impl ClipsNftContract {
 
         data.owner = to.clone();
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
-        let gas_used = GAS_BASE_TRANSFER;
+
+        // Track gas usage for transfer_from
+        let total_gas: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalGasTransfer)
+            .unwrap_or(0);
+        let count_transfer: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CountTransfer)
+            .unwrap_or(0);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalGasTransfer, &(total_gas + GAS_BASE_TRANSFER));
+        env.storage()
+            .instance()
+            .set(&DataKey::CountTransfer, &(count_transfer + 1));
+
         env.events().publish(
             (symbol_short!("transfer"),),
-            TransferEvent { token_id, from, to, gas_used },
+            TransferEvent { token_id, from, to },
         );
 
         Ok(())
@@ -902,6 +963,64 @@ impl ClipsNftContract {
         } else {
             false
         }
+    }
+
+    /// Returns the average gas cost for mint operations.
+    /// Returns 0 if no mints have been performed.
+    pub fn average_gas_mint(env: Env) -> u64 {
+        let total_gas: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalGasMint)
+            .unwrap_or(0);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CountMint)
+            .unwrap_or(0);
+        
+        if count == 0 {
+            0
+        } else {
+            total_gas / count
+        }
+    }
+
+    /// Returns the average gas cost for transfer operations.
+    /// Returns 0 if no transfers have been performed.
+    pub fn average_gas_transfer(env: Env) -> u64 {
+        let total_gas: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalGasTransfer)
+            .unwrap_or(0);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CountTransfer)
+            .unwrap_or(0);
+        
+        if count == 0 {
+            0
+        } else {
+            total_gas / count
+        }
+    }
+
+    /// Returns the total number of mint operations performed.
+    pub fn total_mints(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CountMint)
+            .unwrap_or(0)
+    }
+
+    /// Returns the total number of transfer operations performed.
+    pub fn total_transfers(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CountTransfer)
+            .unwrap_or(0)
     }
 
     // -------------------------------------------------------------------------
