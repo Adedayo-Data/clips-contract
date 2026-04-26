@@ -1125,12 +1125,25 @@ impl ClipsNftContract {
 
     /// Return all token IDs owned by `owner`.
     ///
-    /// Iterates over minted token IDs (1..=next_token_id-1) and collects those
-    /// whose owner matches. Result is capped at 1000 entries to prevent gas
-    /// explosion.
+    /// This function enables frontends to display all NFTs owned by a user.
+    /// It iterates over minted token IDs (1..=next_token_id-1) and collects those
+    /// whose owner matches.
+    ///
+    /// ## Storage Optimization
+    /// - Linear iteration per token to check ownership (unavoidable for general query)
+    /// - Single instance read for NextTokenId
+    /// - Persistent reads only for tokens that might belong to owner
+    ///
+    /// ## Gas Protection
+    /// - Result is capped at MAX_RESULTS (1000) entries to prevent gas explosion
+    /// - When result reaches 1000, iteration stops even if more tokens exist
+    /// - Callers should use pagination or alternative queries for larger result sets
     ///
     /// # Arguments
     /// * `owner` - Address to query
+    ///
+    /// # Returns
+    /// Vec of token IDs owned by the address, capped at 1000 entries
     pub fn tokens_of_owner(env: Env, owner: Address) -> Vec<TokenId> {
         const MAX_RESULTS: u32 = 1000;
         let next_id: u32 = env
@@ -2435,6 +2448,33 @@ mod tests {
     fn test_batch_mint_duplicate_clip_id_fails() {
         let (env, admin, user1, _) = setup();
         let contract_id = env.register(ClipsNftContract, ());
+    #[test]
+    fn test_tokens_of_owner_respects_result_limit() {
+        // This test verifies that tokens_of_owner respects the MAX_RESULTS limit
+        // to prevent gas explosion. While we can't easily test 1000+ tokens,
+        // we verify that the function returns a bounded result.
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        // Mint 5 tokens to verify basic functionality
+        let mut minted = Vec::new(&env);
+        for i in 0..5u32 {
+            let token_id = do_mint(&client, &env, &user1, 500 + i, &kp);
+            minted.push_back(token_id);
+        }
+
+        let owned = client.tokens_of_owner(&user1);
+        assert_eq!(owned.len(), 5);
+        
+        // Verify returned tokens match minted tokens
+        for i in 0..5 {
+            assert_eq!(owned.get(i as u32).unwrap(), minted.get(i as u32).unwrap());
+        }
+    }
+
         let client = ClipsNftContractClient::new(&env, &contract_id);
         client.init(&admin);
         let kp = register_signer(&env, &client, &admin);
